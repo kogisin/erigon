@@ -215,7 +215,7 @@ func (tx *AccountAbstractionTransaction) Hash() common.Hash {
 	if hash := tx.hash.Load(); hash != nil {
 		return *hash
 	}
-	hash := doublePrefixedRlpHash(AccountAbstractionTxType, 0x00, []interface{}{
+	hash := prefixedRlpHash(AccountAbstractionTxType, []interface{}{
 		tx.ChainID,
 		tx.NonceKey, tx.Nonce,
 		tx.SenderAddress,
@@ -235,7 +235,7 @@ func (tx *AccountAbstractionTransaction) Hash() common.Hash {
 }
 
 func (tx *AccountAbstractionTransaction) SigningHash(chainID *big.Int) common.Hash {
-	hash := doublePrefixedRlpHash(AccountAbstractionTxType, 0x00, []interface{}{
+	hash := prefixedRlpHash(AccountAbstractionTxType, []interface{}{
 		chainID,
 		tx.NonceKey, tx.Nonce,
 		tx.SenderAddress,
@@ -320,12 +320,12 @@ func (tx *AccountAbstractionTransaction) payloadSize() (payloadSize, accessListL
 func (tx *AccountAbstractionTransaction) EncodingSize() int {
 	payloadSize, _, _ := tx.payloadSize()
 	// Add envelope size and type size
-	return 2 + rlp.ListPrefixLen(payloadSize) + payloadSize
+	return 1 + rlp.ListPrefixLen(payloadSize) + payloadSize
 }
 
 func (tx *AccountAbstractionTransaction) EncodeRLP(w io.Writer) error {
 	payloadSize, accessListLen, authorizationsLen := tx.payloadSize()
-	envelopSize := 2 + rlp.ListPrefixLen(payloadSize) + payloadSize
+	envelopSize := 1 + rlp.ListPrefixLen(payloadSize) + payloadSize
 	b := newEncodingBuf()
 	defer pooledBuf.Put(b)
 	// encode envelope size
@@ -334,8 +334,7 @@ func (tx *AccountAbstractionTransaction) EncodeRLP(w io.Writer) error {
 	}
 	// encode TxType
 	b[0] = AccountAbstractionTxType
-	b[1] = 0x00
-	if _, err := w.Write(b[:2]); err != nil {
+	if _, err := w.Write(b[:1]); err != nil {
 		return err
 	}
 
@@ -572,7 +571,7 @@ func (tx *AccountAbstractionTransaction) PreTransactionGasCost() (uint64, error)
 	data = append(data, tx.DeployerData...)
 	data = append(data, tx.ExecutionData...)
 	data = append(data, tx.PaymasterData...)
-	gas, _, overflow := fixedgas.IntrinsicGas(data, uint64(len(tx.AccessList)), uint64(tx.AccessList.StorageKeys()), true, true, true, true, true, uint64(len(tx.Authorizations))) // NOTE: should read homestead and 2028 config from chainconfig
+	gas, _, overflow := fixedgas.IntrinsicGas(data, uint64(len(tx.AccessList)), uint64(tx.AccessList.StorageKeys()), true, true, true, true, true, true, uint64(len(tx.Authorizations))) // NOTE: should read homestead and 2028 config from chainconfig
 
 	if overflow {
 		return 0, errors.New("overflow")
