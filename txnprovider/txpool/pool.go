@@ -37,6 +37,7 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon-lib/chain"
+	"github.com/erigontech/erigon-lib/chain/params"
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/assert"
 	"github.com/erigontech/erigon-lib/common/fixedgas"
@@ -54,7 +55,7 @@ import (
 	"github.com/erigontech/erigon-lib/kv/mdbx"
 	"github.com/erigontech/erigon-lib/kv/order"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/txnprovider"
 	"github.com/erigontech/erigon/txnprovider/txpool/txpoolcfg"
 )
@@ -99,7 +100,7 @@ var _ txnprovider.TxnProvider = (*TxPool)(nil)
 //
 // It preserve TxnSlot objects immutable
 type TxPool struct {
-	_chainDB               kv.RoDB // remote db - use it wisely
+	_chainDB               kv.TemporalRoDB // remote db - use it wisely
 	_stateCache            kvcache.Cache
 	poolDB                 kv.RwDB
 	lock                   *sync.Mutex
@@ -169,7 +170,7 @@ func New(
 	ctx context.Context,
 	newTxns chan Announcements,
 	poolDB kv.RwDB,
-	chainDB kv.RoDB,
+	chainDB kv.TemporalRoDB,
 	cfg txpoolcfg.Config,
 	cache kvcache.Cache,
 	chainID uint256.Int,
@@ -182,6 +183,7 @@ func New(
 	stateChangesClient StateChangesClient,
 	builderNotifyNewTxns func(),
 	newSlotsStreams *NewSlotsStreams,
+	ethBackend remote.ETHBACKENDClient,
 	logger log.Logger,
 	opts ...Option,
 ) (*TxPool, error) {
@@ -232,6 +234,7 @@ func New(
 		minedBlobTxnsByHash:     map[string]*metaTxn{},
 		blobSchedule:            blobSchedule,
 		feeCalculator:           options.feeCalculator,
+		ethBackend:              ethBackend,
 		builderNotifyNewTxns:    builderNotifyNewTxns,
 		newSlotsStreams:         newSlotsStreams,
 		logger:                  logger,
@@ -284,7 +287,7 @@ func (p *TxPool) start(ctx context.Context) error {
 
 	return p.poolDB.View(ctx, func(tx kv.Tx) error {
 		coreDb, _ := p.chainDB()
-		coreTx, err := coreDb.BeginRo(ctx)
+		coreTx, err := coreDb.BeginTemporalRo(ctx)
 		if err != nil {
 			return err
 		}
@@ -308,7 +311,7 @@ func (p *TxPool) OnNewBlock(ctx context.Context, stateChanges *remote.StateChang
 
 	coreDB, cache := p.chainDB()
 	cache.OnNewBlock(stateChanges)
-	coreTx, err := coreDB.BeginRo(ctx)
+	coreTx, err := coreDB.BeginTemporalRo(ctx)
 	if err != nil {
 		return err
 	}
@@ -476,7 +479,7 @@ func (p *TxPool) processRemoteTxns(ctx context.Context) (err error) {
 
 	defer processBatchTxnsTimer.ObserveDuration(time.Now())
 	coreDB, cache := p.chainDB()
-	coreTx, err := coreDB.BeginRo(ctx)
+	coreTx, err := coreDB.BeginTemporalRo(ctx)
 	if err != nil {
 		return err
 	}
@@ -782,7 +785,7 @@ func (p *TxPool) best(ctx context.Context, n int, txns *TxnsRlp, onTopOf, availa
 	defer tx.Rollback()
 	for ; count < n && i < len(best.ms); i++ {
 		// if we wouldn't have enough gas for a standard transaction then quit out early
-		if availableGas < fixedgas.TxGas {
+		if availableGas < params.TxGas {
 			break
 		}
 
@@ -808,10 +811,10 @@ func (p *TxPool) best(ctx context.Context, n int, txns *TxnsRlp, onTopOf, availa
 
 		// Skip transactions that require more blob gas than is available
 		blobCount := uint64(len(mt.TxnSlot.BlobHashes))
-		if blobCount*fixedgas.BlobGasPerBlob > availableBlobGas {
+		if blobCount*params.BlobGasPerBlob > availableBlobGas {
 			continue
 		}
-		availableBlobGas -= blobCount * fixedgas.BlobGasPerBlob
+		availableBlobGas -= blobCount * params.BlobGasPerBlob
 
 		// make sure we have enough gas in the caller to add this transaction.
 		// not an exact science using intrinsic gas but as close as we could hope for at
@@ -931,7 +934,7 @@ func toBlobs(_blobs [][]byte) []gokzg4844.BlobRef {
 
 func (p *TxPool) validateTx(txn *TxnSlot, isLocal bool, stateCache kvcache.CacheView) txpoolcfg.DiscardReason {
 	isShanghai := p.isShanghai() || p.isAgra()
-	if isShanghai && txn.Creation && txn.DataLen > fixedgas.MaxInitCodeSize {
+	if isShanghai && txn.Creation && txn.DataLen > params.MaxInitCodeSize {
 		return txpoolcfg.InitCodeTooLarge // EIP-3860
 	}
 	if txn.Type == BlobTxnType {
@@ -986,31 +989,6 @@ func (p *TxPool) validateTx(txn *TxnSlot, isLocal bool, stateCache kvcache.Cache
 	if txn.Type == types.AccountAbstractionTxType {
 		if !p.cfg.AllowAA {
 			return txpoolcfg.TypeNotActivated
-		}
-
-		senderCode, err := stateCache.GetCode(txn.SenderAddress[:])
-		if err != nil {
-			return txpoolcfg.ErrGetCode
-		}
-
-		paymasterCode, err := stateCache.GetCode(txn.Paymaster[:])
-		if err != nil {
-			return txpoolcfg.ErrGetCode
-		}
-
-		deployerCode, err := stateCache.GetCode(txn.Deployer[:])
-		if err != nil {
-			return txpoolcfg.ErrGetCode
-		}
-
-		err = AAStaticValidation(
-			txn.Paymaster, txn.Deployer, txn.SenderAddress,
-			txn.PaymasterData, txn.DeployerData,
-			txn.PaymasterValidationGasLimit,
-			len(senderCode), len(paymasterCode), len(deployerCode),
-		)
-		if err != nil {
-			return txpoolcfg.InvalidAA
 		}
 
 		res, err := p.ethBackend.AAValidation(context.Background(), &remote.AAValidationRequest{Tx: txn.ToProtoAccountAbstractionTxn()}) // enforces ERC-7562 rules
@@ -1097,76 +1075,6 @@ func (p *TxPool) validateTx(txn *TxnSlot, isLocal bool, stateCache kvcache.Cache
 	return txpoolcfg.Success
 }
 
-func AAStaticValidation(
-	paymasterAddress, deployerAddress, senderAddress *common.Address,
-	paymasterData, deployerData []byte,
-	paymasterValidationGasLimit uint64,
-	senderCodeSize, paymasterCodeSize, deployerCodeSize int,
-) error {
-	hasPaymaster := paymasterAddress != nil
-	hasPaymasterData := paymasterData != nil && len(paymasterData) != 0
-	hasPaymasterGasLimit := paymasterValidationGasLimit != 0
-	hasDeployer := deployerAddress != nil
-	hasDeployerData := deployerData != nil && len(deployerData) != 0
-	hasCodeSender := senderCodeSize != 0
-	hasCodeDeployer := deployerCodeSize != 0
-
-	if !hasDeployer && hasDeployerData {
-		return fmt.Errorf(
-			"deployer data of size %d is provided but deployer address is not set",
-			len(deployerData),
-		)
-
-	}
-	if !hasPaymaster && (hasPaymasterData || hasPaymasterGasLimit) {
-		return fmt.Errorf(
-			"paymaster data of size %d (or a gas limit: %d) is provided but paymaster address is not set",
-			len(deployerData), paymasterValidationGasLimit,
-		)
-
-	}
-
-	if hasPaymaster {
-		if !hasPaymasterGasLimit {
-			return fmt.Errorf(
-				"paymaster address  %s is provided but 'paymasterVerificationGasLimit' is zero",
-				paymasterAddress.String(),
-			)
-
-		}
-		hasCodePaymaster := paymasterCodeSize != 0
-		if !hasCodePaymaster {
-			return fmt.Errorf(
-				"paymaster address %s is provided but contract has no code deployed",
-				paymasterAddress.String(),
-			)
-
-		}
-	}
-
-	if hasDeployer {
-		if !hasCodeDeployer {
-			return fmt.Errorf(
-				"deployer address %s is provided but contract has no code deployed",
-				deployerAddress.String(),
-			)
-
-		}
-		if hasCodeSender {
-			return fmt.Errorf(
-				"sender address %s and deployer address %s are provided but sender is already deployed",
-				senderAddress.String(), deployerAddress.String(),
-			)
-		}
-	}
-
-	if !hasDeployer && !hasCodeSender {
-		return errors.New("account is not deployed and no deployer is specified")
-	}
-
-	return nil
-}
-
 var maxUint256 = new(uint256.Int).SetAllOne()
 
 // Sender should have enough balance for: gasLimit x feeCap + blobGas x blobFeeCap + transferred_value
@@ -1181,7 +1089,7 @@ func requiredBalance(txn *TxnSlot) *uint256.Int {
 	// and https://eips.ethereum.org/EIPS/eip-4844#gas-accounting
 	blobCount := uint64(len(txn.BlobHashes))
 	if blobCount != 0 {
-		maxBlobGasCost := uint256.NewInt(fixedgas.BlobGasPerBlob)
+		maxBlobGasCost := uint256.NewInt(params.BlobGasPerBlob)
 		maxBlobGasCost.Mul(maxBlobGasCost, uint256.NewInt(blobCount))
 		_, overflow = maxBlobGasCost.MulOverflow(maxBlobGasCost, &txn.BlobFeeCap)
 		if overflow {
@@ -1410,7 +1318,7 @@ func fillDiscardReasons(reasons []txpoolcfg.DiscardReason, newTxns TxnSlots, dis
 
 func (p *TxPool) AddLocalTxns(ctx context.Context, newTxns TxnSlots) ([]txpoolcfg.DiscardReason, error) {
 	coreDb, cache := p.chainDB()
-	coreTx, err := coreDb.BeginRo(ctx)
+	coreTx, err := coreDb.BeginTemporalRo(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1466,7 +1374,7 @@ func (p *TxPool) AddLocalTxns(ctx context.Context, newTxns TxnSlots) ([]txpoolcf
 	return reasons, nil
 }
 
-func (p *TxPool) chainDB() (kv.RoDB, kvcache.Cache) {
+func (p *TxPool) chainDB() (kv.TemporalRoDB, kvcache.Cache) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	return p._chainDB, p._stateCache
@@ -2433,7 +2341,7 @@ func (p *TxPool) flushLocked(tx kv.RwTx) (err error) {
 
 	txHashes := p.isLocalLRU.Keys()
 	encID := make([]byte, 8)
-	if err := tx.ClearBucket(kv.RecentLocalTransaction); err != nil {
+	if err := tx.ClearTable(kv.RecentLocalTransaction); err != nil {
 		return err
 	}
 	for i, txHash := range txHashes {
@@ -2490,7 +2398,7 @@ func (p *TxPool) flushLocked(tx kv.RwTx) (err error) {
 	return nil
 }
 
-func (p *TxPool) fromDB(ctx context.Context, tx kv.Tx, coreTx kv.Tx) error {
+func (p *TxPool) fromDB(ctx context.Context, tx kv.Tx, coreTx kv.TemporalTx) error {
 	if p.lastSeenBlock.Load() == 0 {
 		lastSeenBlock, err := LastSeenBlock(tx)
 		if err != nil {
@@ -2667,28 +2575,39 @@ func (p *TxPool) logStats() {
 
 // Deprecated need switch to streaming-like
 func (p *TxPool) deprecatedForEach(_ context.Context, f func(rlp []byte, sender common.Address, t SubPoolType), tx kv.Tx) {
+	var txns []*metaTxn
+	var senders []common.Address
+
 	p.lock.Lock()
-	defer p.lock.Unlock()
+
 	p.all.ascendAll(func(mt *metaTxn) bool {
-		slot := mt.TxnSlot
-		slotRlp := slot.Rlp
-		if slot.Rlp == nil {
-			v, err := tx.GetOne(kv.PoolTransaction, slot.IDHash[:])
+		if sender, found := p.senders.senderID2Addr[mt.TxnSlot.SenderID]; found {
+			txns = append(txns, mt)
+			senders = append(senders, sender)
+		}
+
+		return true
+	})
+
+	p.lock.Unlock()
+
+	for i := range txns {
+		slotRlp := txns[i].TxnSlot.Rlp
+		if slotRlp == nil {
+			v, err := tx.GetOne(kv.PoolTransaction, txns[i].TxnSlot.IDHash[:])
 			if err != nil {
 				p.logger.Warn("[txpool] foreach: get txn from db", "err", err)
-				return true
+				continue
 			}
 			if v == nil {
 				p.logger.Warn("[txpool] foreach: txn not found in db")
-				return true
+				continue
 			}
 			slotRlp = v[20:]
 		}
-		if sender, found := p.senders.senderID2Addr[slot.SenderID]; found {
-			f(slotRlp, sender, mt.currentSubPool)
-		}
-		return true
-	})
+
+		f(slotRlp, senders[i], txns[i].currentSubPool)
+	}
 }
 
 func sendChangeBatchEventToDiagnostics(pool string, event string, orderHashes []diagnostics.TxnHashOrder) {

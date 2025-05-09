@@ -284,21 +284,20 @@ func (s *VisibleSegment) IsIndexed() bool {
 	return s.src.IsIndexed()
 }
 
-func (v *VisibleSegment) Get(globalId uint64) ([]byte, error) {
-	idxSlot := v.src.Index()
+func (s *VisibleSegment) Get(globalId uint64) ([]byte, error) {
+	idxSlot := s.src.Index()
 
 	if idxSlot == nil {
 		return nil, nil
 	}
 	blockOffset := idxSlot.OrdinalLookup(globalId - idxSlot.BaseDataID())
 
-	gg := v.src.MakeGetter()
+	gg := s.src.MakeGetter()
 	gg.Reset(blockOffset)
 	if !gg.HasNext() {
 		return nil, nil
 	}
-	var buf []byte
-	buf, _ = gg.Next(buf)
+	buf, _ := gg.Next(nil)
 	if len(buf) == 0 {
 		return nil, nil
 	}
@@ -313,7 +312,7 @@ func DirtySegmentLess(i, j *DirtySegment) bool {
 	if i.to != j.to {
 		return i.to < j.to
 	}
-	return int(i.version) < int(j.version)
+	return i.version.Less(j.version)
 }
 
 func (s *DirtySegment) Type() snaptype.Type {
@@ -505,6 +504,7 @@ type BlockSnapshots interface {
 	SetSegmentsMin(uint64)
 
 	DownloadComplete()
+	RemoveOverlaps() error
 	DownloadReady() bool
 	Ready(context.Context) <-chan error
 }
@@ -740,7 +740,19 @@ func (s *RoSnapshots) EnableReadAhead() *RoSnapshots {
 
 	for _, t := range s.enums {
 		for _, sn := range v.segments[t].Segments {
-			sn.src.EnableReadAhead()
+			sn.src.MadvSequential()
+		}
+	}
+
+	return s
+}
+func (s *RoSnapshots) MadvNormal() *RoSnapshots {
+	v := s.View()
+	defer v.Close()
+
+	for _, t := range s.enums {
+		for _, sn := range v.segments[t].Segments {
+			sn.src.MadvNormal()
 		}
 	}
 
@@ -753,7 +765,7 @@ func (s *RoSnapshots) EnableMadvWillNeed() *RoSnapshots {
 
 	for _, t := range s.enums {
 		for _, sn := range v.segments[t].Segments {
-			sn.src.EnableMadvWillNeed()
+			sn.src.MadvWillNeed()
 		}
 	}
 	return s
@@ -851,7 +863,7 @@ func (s *RoSnapshots) idxAvailability() uint64 {
 	// Use-Cases:
 	//   1. developers can add new types in future. and users will not have files of this type
 	//   2. some types are network-specific. example: borevents exists only on Bor-consensus networks
-	//   3. user can manually remove 1 .idx file: `rm snapshots/v1-type1-0000-1000.idx`
+	//   3. user can manually remove 1 .idx file: `rm snapshots/v1.0-type1-0000-1000.idx`
 	//   4. user can manually remove all .idx files of given type: `rm snapshots/*type1*.idx`
 	//   5. file-types may have different height: 10 headers, 10 bodies, 9 transactions (for example if `kill -9` came during files building/merge). still need index all 3 types.
 
@@ -996,7 +1008,7 @@ func (s *RoSnapshots) InitSegments(fileNames []string) error {
 	return nil
 }
 
-func TypedSegments(dir string, minBlock uint64, types []snaptype.Type, allowGaps bool) (res []snaptype.FileInfo, missingSnapshots []Range, err error) {
+func TypedSegments(dir string, _ uint64, types []snaptype.Type, allowGaps bool) (res []snaptype.FileInfo, missingSnapshots []Range, err error) {
 	list, err := snaptype.Segments(dir)
 
 	if err != nil {
@@ -1233,7 +1245,21 @@ func (s *RoSnapshots) closeWhatNotInList(l []string) {
 
 func (s *RoSnapshots) RemoveOverlaps() error {
 	list, err := snaptype.Segments(s.dir)
+	if err != nil {
+		return err
+	}
+	if _, toRemove := findOverlaps(list); len(toRemove) > 0 {
+		filesToRemove := make([]string, 0, len(toRemove))
 
+		for _, info := range toRemove {
+			filesToRemove = append(filesToRemove, info.Path)
+		}
+
+		removeOldFiles(filesToRemove, s.dir)
+	}
+
+	//it's possible that .seg was remove but .idx not (kill between deletes, etc...)
+	list, err = snaptype.IdxFiles(s.dir)
 	if err != nil {
 		return err
 	}
@@ -1247,7 +1273,6 @@ func (s *RoSnapshots) RemoveOverlaps() error {
 
 		removeOldFiles(filesToRemove, s.dir)
 	}
-
 	return nil
 }
 
@@ -1589,7 +1614,7 @@ func removeOldFiles(toDel []string, snapDir string) {
 	}
 }
 
-func SegmentsCaplin(dir string, minBlock uint64) (res []snaptype.FileInfo, missingSnapshots []Range, err error) {
+func SegmentsCaplin(dir string, _ uint64) (res []snaptype.FileInfo, missingSnapshots []Range, err error) {
 	list, err := snaptype.Segments(dir)
 	if err != nil {
 		return nil, missingSnapshots, err

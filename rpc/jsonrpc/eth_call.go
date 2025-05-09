@@ -27,8 +27,9 @@ import (
 	"github.com/holiman/uint256"
 	"google.golang.org/grpc"
 
+	"github.com/erigontech/erigon-lib/chain/params"
 	"github.com/erigontech/erigon-lib/commitment"
-	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/crypto"
 	"github.com/erigontech/erigon-lib/gointerfaces"
@@ -40,15 +41,14 @@ import (
 	"github.com/erigontech/erigon-lib/log/v3"
 	libstate "github.com/erigontech/erigon-lib/state"
 	"github.com/erigontech/erigon-lib/trie"
+	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
-	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/eth/stagedsync"
 	"github.com/erigontech/erigon/eth/tracers/logger"
 	"github.com/erigontech/erigon/execution/consensus"
-	"github.com/erigontech/erigon/params"
 	"github.com/erigontech/erigon/rpc"
 	ethapi2 "github.com/erigontech/erigon/rpc/ethapi"
 	"github.com/erigontech/erigon/rpc/rpchelper"
@@ -76,15 +76,11 @@ func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, blockNrOrHa
 		args.Gas = (*hexutil.Uint64)(&api.GasCap)
 	}
 
-	blockNumber, hash, _, err := rpchelper.GetCanonicalBlockNumber(ctx, blockNrOrHash, tx, api._blockReader, api.filters) // DoCall cannot be executed on non-canonical blocks
+	header, err := headerByNumberOrHash(ctx, tx, blockNrOrHash, api)
 	if err != nil {
 		return nil, err
 	}
-	block, err := api.blockWithSenders(ctx, tx, hash, blockNumber)
-	if err != nil {
-		return nil, err
-	}
-	if block == nil {
+	if header == nil {
 		return nil, nil
 	}
 
@@ -92,7 +88,6 @@ func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, blockNrOrHa
 	if err != nil {
 		return nil, err
 	}
-	header := block.HeaderNoCopy()
 	result, err := transactions.DoCall(ctx, engine, args, tx, blockNrOrHash, header, overrides, api.GasCap, chainConfig, stateReader, api._blockReader, api.evmCallTimeout)
 	if err != nil {
 		return nil, err
@@ -163,12 +158,21 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		return 0, err
 	}
 
-	// try and get the block from the lru cache first then try DB before failing
 	block := api.tryBlockFromLru(blockHash)
+
+	// try and get the block from the lru cache first then try DB before failing
 	if block == nil {
 		block, err = api.blockWithSenders(ctx, dbtx, blockHash, blockNum)
 		if err != nil {
 			return 0, err
+		}
+	}
+
+	// try to check if it is a pending block
+	if block == nil {
+		b := api.filters.LastPendingBlock()
+		if b != nil && blockNum == b.NumberU64() {
+			block = b
 		}
 	}
 
@@ -189,7 +193,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	)
 	// Use zero address if sender unspecified.
 	if args.From == nil {
-		args.From = new(libcommon.Address)
+		args.From = new(common.Address)
 	}
 
 	// Determine the highest gas limit can be used during the estimation.
@@ -213,7 +217,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	} else if args.MaxFeePerGas != nil {
 		feeCap = args.MaxFeePerGas.ToInt()
 	} else {
-		feeCap = libcommon.Big0
+		feeCap = common.Big0
 	}
 	// Recap the highest gas limit with account's available balance.
 	if feeCap.Sign() != 0 {
@@ -299,7 +303,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 }
 
 // GetProof implements eth_getProof partially; Proofs are available only with the `latest` block tag.
-func (api *APIImpl) GetProof(ctx context.Context, address libcommon.Address, storageKeys []hexutil.Bytes, blockNrOrHash rpc.BlockNumberOrHash) (*accounts.AccProofResult, error) {
+func (api *APIImpl) GetProof(ctx context.Context, address common.Address, storageKeys []hexutil.Bytes, blockNrOrHash rpc.BlockNumberOrHash) (*accounts.AccProofResult, error) {
 	roTx, err := api.db.BeginRo(ctx)
 	if err != nil {
 		return nil, err
@@ -313,14 +317,14 @@ func (api *APIImpl) GetProof(ctx context.Context, address libcommon.Address, sto
 		return nil, errors.New("block not found")
 	}
 
-	storageKeysConverted := make([]libcommon.Hash, len(storageKeys))
+	storageKeysConverted := make([]common.Hash, len(storageKeys))
 	for i, s := range storageKeys {
 		storageKeysConverted[i].SetBytes(s)
 	}
 	return api.getProof(ctx, roTx, address, storageKeysConverted, rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(requestedBlockNr)), api.db, api.logger)
 }
 
-func (api *APIImpl) getProof(ctx context.Context, roTx kv.Tx, address libcommon.Address, storageKeys []libcommon.Hash, blockNrOrHash rpc.BlockNumberOrHash, db kv.RoDB, logger log.Logger) (*accounts.AccProofResult, error) {
+func (api *APIImpl) getProof(ctx context.Context, roTx kv.Tx, address common.Address, storageKeys []common.Hash, blockNrOrHash rpc.BlockNumberOrHash, db kv.RoDB, logger log.Logger) (*accounts.AccProofResult, error) {
 	tx, err := api.db.BeginTemporalRo(ctx)
 	if err != nil {
 		return nil, err
@@ -332,7 +336,7 @@ func (api *APIImpl) getProof(ctx context.Context, roTx kv.Tx, address libcommon.
 		return nil, err
 	}
 
-	domains, err := libstate.NewSharedDomains(roTx, log.New())
+	domains, err := libstate.NewSharedDomains(tx, log.New())
 	if err != nil {
 		return nil, err
 	}
@@ -378,8 +382,8 @@ func (api *APIImpl) getProof(ctx context.Context, roTx kv.Tx, address libcommon.
 		Address:      address,
 		Balance:      new(hexutil.Big),
 		Nonce:        hexutil.Uint64(0),
-		CodeHash:     libcommon.Hash{},
-		StorageHash:  libcommon.Hash{},
+		CodeHash:     common.Hash{},
+		StorageHash:  common.Hash{},
 		StorageProof: make([]accounts.StorProofResult, len(storageKeys)),
 	}
 
@@ -409,10 +413,10 @@ func (api *APIImpl) getProof(ctx context.Context, roTx kv.Tx, address libcommon.
 	proof.StorageHash = acc.Root
 
 	// if storage is not empty touch keys and build trie
-	if proof.StorageHash.Cmp(libcommon.BytesToHash(commitment.EmptyRootHash)) != 0 && len(storageKeys) != 0 {
+	if proof.StorageHash.Cmp(common.BytesToHash(commitment.EmptyRootHash)) != 0 && len(storageKeys) != 0 {
 		// touch storage keys
 		for _, storageKey := range storageKeys {
-			sdCtx.TouchKey(kv.StorageDomain, string(libcommon.FromHex(address.Hex()[2:]+storageKey.String()[2:])), nil)
+			sdCtx.TouchKey(kv.StorageDomain, string(common.FromHex(address.Hex()[2:]+storageKey.String()[2:])), nil)
 		}
 
 		// generate the trie for proofs, this works by loading the merkle paths to the touched keys
@@ -432,7 +436,7 @@ func (api *APIImpl) getProof(ctx context.Context, roTx kv.Tx, address libcommon.
 		proof.StorageProof[i].Key = uint256.NewInt(0).SetBytes(keyHash[:]).Hex()
 
 		// if we have simple non contract account just set values directly without requesting any key proof
-		if proof.StorageHash.Cmp(libcommon.BytesToHash(commitment.EmptyRootHash)) == 0 {
+		if proof.StorageHash.Cmp(common.BytesToHash(commitment.EmptyRootHash)) == 0 {
 			proof.StorageProof[i].Proof = nil
 			proof.StorageProof[i].Value = new(hexutil.Big)
 			continue
@@ -449,7 +453,7 @@ func (api *APIImpl) getProof(ctx context.Context, roTx kv.Tx, address libcommon.
 			return nil, errors.New("cannot verify store proof")
 		}
 
-		res, err := reader.ReadAccountStorage(address, acc.Incarnation, &keyHash)
+		res, err := reader.ReadAccountStorage(address, &keyHash)
 		if err != nil {
 			res = []byte{}
 			logger.Warn(fmt.Sprintf("couldn't read account storage for the address %s\n", address.String()))
@@ -611,7 +615,7 @@ func (api *BaseAPI) getWitness(ctx context.Context, db kv.RoDB, blockNrOrHash rp
 	if err != nil {
 		return nil, err
 	}
-	sdCtx := libstate.NewSharedDomainsCommitmentContext(domains, commitment.ModeUpdate, commitment.VariantHexPatriciaTrie)
+	sdCtx := domains.GetCommitmentContext()
 	patricieTrie := sdCtx.Trie()
 	hph, ok := patricieTrie.(*commitment.HexPatriciaHashed)
 	if !ok {
@@ -688,11 +692,11 @@ func (api *BaseAPI) getWitness(ctx context.Context, db kv.RoDB, blockNrOrHash rp
 		fmt.Printf("state root mismatch after stateless execution actual(%x) != expected(%x)\n", newStateRoot.Bytes(), block.Root().Bytes())
 	}
 	witnessBufBytes := witnessBuffer.Bytes()
-	witnessBufBytesCopy := libcommon.CopyBytes(witnessBufBytes)
+	witnessBufBytesCopy := common.CopyBytes(witnessBufBytes)
 	return witnessBufBytesCopy, nil
 }
 
-func (api *APIImpl) tryBlockFromLru(hash libcommon.Hash) *types.Block {
+func (api *APIImpl) tryBlockFromLru(hash common.Hash) *types.Block {
 	var block *types.Block
 	if api.blocksLRU != nil {
 		if it, ok := api.blocksLRU.Get(hash); ok && it != nil {
@@ -763,7 +767,7 @@ func (api *APIImpl) CreateAccessList(ctx context.Context, args ethapi2.CallArgs,
 	// lists and we'll need to reestimate every time
 	nogas := args.Gas == nil
 
-	var to libcommon.Address
+	var to common.Address
 	if args.To != nil {
 		to = *args.To
 	} else {
@@ -792,12 +796,12 @@ func (api *APIImpl) CreateAccessList(ctx context.Context, args ethapi2.CallArgs,
 	}
 
 	if args.From == nil {
-		args.From = &libcommon.Address{}
+		args.From = &common.Address{}
 	}
 
 	// Retrieve the precompiles since they don't need to be added to the access list
 	precompiles := vm.ActivePrecompiles(chainConfig.Rules(blockNumber, header.Time))
-	excl := make(map[libcommon.Address]struct{})
+	excl := make(map[common.Address]struct{})
 	for _, pc := range precompiles {
 		excl[pc] = struct{}{}
 	}
@@ -870,7 +874,7 @@ func (api *APIImpl) CreateAccessList(ctx context.Context, args ethapi2.CallArgs,
 // some addresses (like sender, recipient, block producer, and created contracts)
 // are considered warm already, so we can save by adding these to the access list
 // only if we are adding a lot of their respective storage slots as well
-func optimizeWarmAddrInAccessList(accessList *accessListResult, addr libcommon.Address) {
+func optimizeWarmAddrInAccessList(accessList *accessListResult, addr common.Address) {
 	indexToRemove := -1
 
 	for i := 0; i < len(*accessList.Accesslist); i++ {

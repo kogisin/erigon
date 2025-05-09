@@ -17,6 +17,7 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/datadir"
 	"github.com/erigontech/erigon-lib/common/dir"
+	downloadertype "github.com/erigontech/erigon-lib/downloader/snaptype"
 	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/kv/stream"
@@ -33,11 +34,8 @@ func (a *Aggregator) Sqeeze(ctx context.Context, domain kv.Domain) error {
 	filesToRemove := []string{}
 	for _, to := range domainFiles(a.dirs, domain) {
 		_, fileName := filepath.Split(to)
-		fromStep, toStep, err := ParseStepsFromFileName(fileName)
-		if err != nil {
-			return err
-		}
-		if toStep-fromStep < DomainMinStepsToCompress {
+		res, _, _ := downloadertype.ParseFileName("", fileName)
+		if res.To-res.From < DomainMinStepsToCompress {
 			continue
 		}
 
@@ -85,7 +83,7 @@ func (a *Aggregator) sqeezeDomainFile(ctx context.Context, domain kv.Domain, fro
 		return err
 	}
 	defer decompressor.Close()
-	defer decompressor.EnableReadAhead().DisableReadAhead()
+	defer decompressor.MadvSequential().DisableReadAhead()
 	r := seg.NewReader(decompressor.MakeGetter(), seg.DetectCompressType(decompressor.MakeGetter()))
 
 	c, err := seg.NewCompressor(ctx, "sqeeze", to, a.dirs.Tmp, compressCfg, log.LvlInfo, a.logger)
@@ -112,7 +110,7 @@ func SqueezeCommitmentFiles(at *AggregatorRoTx, logger log.Logger) error {
 	}
 
 	rng := &Ranges{
-		domain: [5]DomainRanges{
+		domain: [kv.DomainLen]DomainRanges{
 			kv.AccountsDomain: {
 				name:    kv.AccountsDomain,
 				values:  MergeRange{"", true, 0, math.MaxUint64},
@@ -194,9 +192,9 @@ func SqueezeCommitmentFiles(at *AggregatorRoTx, logger log.Logger) error {
 			return err
 		}
 
-		af.decompressor.EnableMadvNormal()
-		sf.decompressor.EnableMadvNormal()
-		cf.decompressor.EnableMadvNormal()
+		af.decompressor.MadvNormal()
+		sf.decompressor.MadvNormal()
+		cf.decompressor.MadvNormal()
 
 		err = func() error {
 			steps := cf.endTxNum/at.a.aggregationStep - cf.startTxNum/at.a.aggregationStep
@@ -245,10 +243,10 @@ func SqueezeCommitmentFiles(at *AggregatorRoTx, logger log.Logger) error {
 						return fmt.Errorf("failed to transform commitment value: %w", err)
 					}
 				}
-				if err = writer.AddWord(k); err != nil {
+				if _, err = writer.Write(k); err != nil {
 					return fmt.Errorf("write key word: %w", err)
 				}
-				if err = writer.AddWord(v); err != nil {
+				if _, err = writer.Write(v); err != nil {
 					return fmt.Errorf("write value word: %w", err)
 				}
 
@@ -311,9 +309,10 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 
 	acRo := a.BeginFilesRo() // this tx is used to read existing domain files and closed in the end
 	defer acRo.Close()
+	defer acRo.MadvNormal().DisableReadAhead()
 
 	rng := &Ranges{
-		domain: [5]DomainRanges{
+		domain: [kv.DomainLen]DomainRanges{
 			kv.AccountsDomain: {
 				name:    kv.AccountsDomain,
 				values:  MergeRange{"", true, 0, math.MaxUint64},
@@ -338,8 +337,6 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 		return nil, errors.New("no account files found")
 	}
 
-	acRo.madvNormal()
-	defer acRo.disableReadAhead()
 	start := time.Now()
 	defer func() { logger.Info("Commitment DONE", "duration", time.Since(start)) }()
 
@@ -418,7 +415,7 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 				return true, k
 			}
 
-			rwTx, err := rwDb.BeginRw(ctx)
+			rwTx, err := rwDb.BeginTemporalRw(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -433,7 +430,7 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 			domains.SetTxNum(lastTxnumInShard - 1)
 			domains.sdCtx.SetLimitReadAsOfTxNum(domains.TxNum()+1, true) // this helps to read state from correct file during commitment
 
-			rebuiltCommit, err = rebuildCommitmentShard(ctx, domains, domains.roTx, domains.aggTx, nextKey, &rebuiltCommitment{
+			rebuiltCommit, err = rebuildCommitmentShard(ctx, domains, domains.roTtx, domains.AggTx(), nextKey, &rebuiltCommitment{
 				StepFrom: shardFrom,
 				StepTo:   shardTo,
 				TxnFrom:  fromTxNumRange,

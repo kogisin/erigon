@@ -6,7 +6,9 @@ import (
 	"sync"
 
 	"github.com/erigontech/erigon-lib/common/dir"
+	"github.com/erigontech/erigon-lib/datastruct/existence"
 	"github.com/erigontech/erigon-lib/downloader/snaptype"
+	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/recsplit"
 	"github.com/erigontech/erigon-lib/seg"
@@ -18,7 +20,7 @@ import (
 // ii) dirtyfile integration
 // iii) opening folder with dirty files
 // iv) snap creation/merge configuration
-// v) fileItemsWithMissingAccessors - missedBtreeAccessor/missedMapAccessor
+// v) fileItemsWithMissedAccessors - missedBtreeAccessor/missedMapAccessor
 
 // maybe accessor/btree build functions and data_file (.kv, .v, .seg) can also be supplied
 // here as interfaces, this would allow more functions currently in DHII+A to be included here.
@@ -99,23 +101,27 @@ func (f *SnapshotRepo) IntegrateDirtyFiles(files []*filesItem) {
 	}
 }
 
-func (f *SnapshotRepo) RecalcVisibleFiles(to RootNum) {
+func (f *SnapshotRepo) DirtyFilesMaxRootNum() RootNum {
+	fi, found := f.dirtyFiles.Max()
+	if !found {
+		return 0
+	}
+	return RootNum(fi.endTxNum)
+}
+
+func (f *SnapshotRepo) RecalcVisibleFiles(to RootNum) (maxRootNum RootNum) {
 	f.current = f.calcVisibleFiles(to)
+	return RootNum(f.current.EndTxNum())
 }
 
-type VisibleFile interface {
-	Filename() string
-	StartTxNum() uint64
-	EndTxNum() uint64
-}
-
-type VisibleFiles []VisibleFile
+type VisibleFile = kv.VisibleFile
+type VisibleFiles = kv.VisibleFiles
 
 func (f *SnapshotRepo) visibleFiles() visibleFiles {
 	return f.current
 }
 
-func (f *SnapshotRepo) VisibleFiles() (files []VisibleFile) {
+func (f *SnapshotRepo) VisibleFiles() (files VisibleFiles) {
 	for _, file := range f.current {
 		files = append(files, file)
 	}
@@ -132,9 +138,9 @@ func (f *SnapshotRepo) DirtyFilesWithNoBtreeAccessors() (l []*filesItem) {
 	}
 	p := f.schema
 	ss := f.stepSize
-	v := ee.Version(1)
+	v := snaptype.V1_0
 
-	return fileItemsWithMissingAccessors(f.dirtyFiles, f.stepSize, func(fromStep uint64, toStep uint64) []string {
+	return fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep uint64, toStep uint64) []string {
 		from, to := RootNum(fromStep*ss), RootNum(toStep*ss)
 		fname := p.BtIdxFile(v, from, to)
 		return []string{fname, p.ExistenceFile(v, from, to)}
@@ -147,11 +153,11 @@ func (f *SnapshotRepo) DirtyFilesWithNoHashAccessors() (l []*filesItem) {
 	}
 	p := f.schema
 	ss := f.stepSize
-	v := ee.Version(1)
+	v := snaptype.V1_0
 	accCount := f.schema.AccessorIdxCount()
 	files := make([]string, accCount)
 
-	return fileItemsWithMissingAccessors(f.dirtyFiles, f.stepSize, func(fromStep uint64, toStep uint64) []string {
+	return fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep uint64, toStep uint64) []string {
 		for i := uint64(0); i < accCount; i++ {
 			files[i] = p.AccessorIdxFile(v, RootNum(fromStep*ss), RootNum(toStep*ss), i)
 		}
@@ -188,6 +194,16 @@ func (f *SnapshotRepo) CloseFilesAfterRootNum(after RootNum) {
 		log.Debug(fmt.Sprintf("[snapshots] closing %s, instructed_close_after_%d", fName, rootNum))
 		item.closeFiles()
 	}
+}
+
+func (f *SnapshotRepo) CloseVisibleFilesAfterRootNum(after RootNum) {
+	var i int
+	for i = len(f.current) - 1; i >= 0; i-- {
+		if f.current[i].endTxNum <= uint64(after) {
+			break
+		}
+	}
+	f.current = f.current[:i+1]
 }
 
 func (f *SnapshotRepo) Garbage(visibleFiles []visibleFile, merged *filesItem) (outs []*filesItem) {
@@ -295,7 +311,7 @@ func (f *SnapshotRepo) openDirtyFiles() error {
 	invalidFilesMu := sync.Mutex{}
 	invalidFileItems := make([]*filesItem, 0)
 	p := f.schema
-	version := snaptype.Version(1)
+	version := snaptype.V1_0
 	f.dirtyFiles.Walk(func(items []*filesItem) bool {
 		for _, item := range items {
 			if item.decompressor == nil {
@@ -365,7 +381,7 @@ func (f *SnapshotRepo) openDirtyFiles() error {
 					f.logger.Debug("SnapshotRepo.openDirtyFiles: FileExist", "f", fName, "err", err)
 				}
 				if exists {
-					if item.existence, err = OpenExistenceFilter(fPath); err != nil {
+					if item.existence, err = existence.OpenFilter(fPath); err != nil {
 						_, fName := filepath.Split(fPath)
 						f.logger.Error("SnapshotRepo.openDirtyFiles", "err", err, "f", fName)
 						// don't interrupt on error. other files maybe good

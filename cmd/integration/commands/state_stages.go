@@ -38,11 +38,11 @@ import (
 	common2 "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/datadir"
 	"github.com/erigontech/erigon-lib/kv"
+	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/cmd/hack/tool/fromdb"
 	"github.com/erigontech/erigon/cmd/utils"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/debugprint"
-	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/eth/ethconfig"
 	"github.com/erigontech/erigon/eth/stagedsync"
 	"github.com/erigontech/erigon/eth/stagedsync/stages"
@@ -156,23 +156,17 @@ func syncBySmallSteps(db kv.TemporalRwDB, miningConfig params.MiningConfig, ctx 
 		return err
 	}
 
-	sn, borSn, agg, _, _, _, err := allSnapshots(ctx, db, logger1)
-	if err != nil {
-		return err
-	}
-	defer sn.Close()
-	defer borSn.Close()
-	defer agg.Close()
 	engine, vmConfig, stateStages, miningStages, miner := newSync(ctx, db, &miningConfig, logger1)
 	chainConfig, pm := fromdb.ChainConfig(db), fromdb.PruneMode(db)
 
-	tx, err := db.BeginRw(ctx)
+	ttx, err := db.BeginTemporalRw(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer ttx.Rollback()
+	var tx kv.RwTx = ttx
 
-	sd, err := stateLib.NewSharedDomains(tx, logger1)
+	sd, err := stateLib.NewSharedDomains(ttx, logger1)
 	if err != nil {
 		return err
 	}
@@ -280,7 +274,7 @@ func syncBySmallSteps(db kv.TemporalRwDB, miningConfig params.MiningConfig, ctx 
 
 		stateStages.MockExecFunc(stages.Execution, execUntilFunc(execToBlock))
 		_ = stateStages.SetCurrentStage(stages.Execution)
-		if _, err := stateStages.Run(db, wrap.TxContainer{Tx: tx, Doms: sd}, false /* firstCycle */, false); err != nil {
+		if _, err := stateStages.Run(db, wrap.NewTxContainer(tx, sd), false /* firstCycle */, false); err != nil {
 			return err
 		}
 
@@ -332,7 +326,7 @@ func syncBySmallSteps(db kv.TemporalRwDB, miningConfig params.MiningConfig, ctx 
 			//})
 
 			_ = miningStages.SetCurrentStage(stages.MiningCreateBlock)
-			if _, err := miningStages.Run(db, wrap.TxContainer{Tx: tx, Doms: sd}, false /* firstCycle */, false); err != nil {
+			if _, err := miningStages.Run(db, wrap.NewTxContainer(tx, sd), false /* firstCycle */, false); err != nil {
 				return err
 			}
 			tx.Rollback()
@@ -390,13 +384,6 @@ func checkMinedBlock(b1, b2 *types.Block, chainConfig *chain2.Config) {
 func loopExec(db kv.TemporalRwDB, ctx context.Context, unwind uint64, logger log.Logger) error {
 	chainConfig := fromdb.ChainConfig(db)
 	dirs, pm := datadir.New(datadirCli), fromdb.PruneMode(db)
-	sn, borSn, agg, _, _, _, err := allSnapshots(ctx, db, logger)
-	if err != nil {
-		return err
-	}
-	defer sn.Close()
-	defer borSn.Close()
-	defer agg.Close()
 	engine, vmConfig, sync, _, _ := newSync(ctx, db, nil, logger)
 
 	tx, err := db.BeginRw(ctx)
@@ -440,7 +427,7 @@ func loopExec(db kv.TemporalRwDB, ctx context.Context, unwind uint64, logger log
 
 		_ = sync.SetCurrentStage(stages.Execution)
 		t := time.Now()
-		if _, err = sync.Run(db, wrap.TxContainer{Tx: tx}, initialCycle, false); err != nil {
+		if _, err = sync.Run(db, wrap.NewTxContainer(tx, nil), initialCycle, false); err != nil {
 			return err
 		}
 		logger.Info("[Integration] ", "loop time", time.Since(t))

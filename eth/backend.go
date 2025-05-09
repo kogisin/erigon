@@ -36,7 +36,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/erigontech/mdbx-go/mdbx"
 	lru "github.com/hashicorp/golang-lru/arc/v2"
 	"github.com/holiman/uint256"
 	"golang.org/x/sync/errgroup"
@@ -45,10 +44,14 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/erigontech/mdbx-go/mdbx"
+
+	"github.com/erigontech/erigon-db/rawdb"
+	"github.com/erigontech/erigon-db/rawdb/blockio"
 	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/chain/networkname"
 	"github.com/erigontech/erigon-lib/chain/snapcfg"
-	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/datadir"
 	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/debug"
@@ -73,12 +76,14 @@ import (
 	prototypes "github.com/erigontech/erigon-lib/gointerfaces/typesproto"
 	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/kv/kvcache"
+	"github.com/erigontech/erigon-lib/kv/kvcfg"
 	"github.com/erigontech/erigon-lib/kv/prune"
 	"github.com/erigontech/erigon-lib/kv/remotedbserver"
 	"github.com/erigontech/erigon-lib/kv/temporal"
 	"github.com/erigontech/erigon-lib/log/v3"
 	libsentry "github.com/erigontech/erigon-lib/p2p/sentry"
 	libstate "github.com/erigontech/erigon-lib/state"
+	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon-lib/wrap"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/persistence/format/snapshot_format/getters"
@@ -86,10 +91,7 @@ import (
 	"github.com/erigontech/erigon/cmd/caplin/caplin1"
 	rpcdaemoncli "github.com/erigontech/erigon/cmd/rpcdaemon/cli"
 	"github.com/erigontech/erigon/core"
-	"github.com/erigontech/erigon/core/rawdb"
-	"github.com/erigontech/erigon/core/rawdb/blockio"
 	snaptype2 "github.com/erigontech/erigon/core/snaptype"
-	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/eth/consensuschain"
 	"github.com/erigontech/erigon/eth/ethconfig"
@@ -154,7 +156,7 @@ type Ethereum struct {
 	engine consensus.Engine
 
 	gasPrice  *uint256.Int
-	etherbase libcommon.Address
+	etherbase common.Address
 
 	networkID uint64
 
@@ -162,7 +164,7 @@ type Ethereum struct {
 	chainConfig  *chain.Config
 	apiList      []rpc.API
 	genesisBlock *types.Block
-	genesisHash  libcommon.Hash
+	genesisHash  common.Hash
 
 	eth1ExecutionServer *eth1.EthereumExecutionModule
 
@@ -239,6 +241,7 @@ func splitAddrIntoHostAndPort(addr string) (host string, port int, err error) {
 }
 
 func checkAndSetCommitmentHistoryFlag(tx kv.RwTx, logger log.Logger, dirs datadir.Dirs, cfg *ethconfig.Config) error {
+
 	isCommitmentHistoryEnabled, ok, err := rawdb.ReadDBCommitmentHistoryEnabled(tx)
 	if err != nil {
 		return err
@@ -272,7 +275,9 @@ func checkAndSetCommitmentHistoryFlag(tx kv.RwTx, logger log.Logger, dirs datadi
 	if err := rawdb.WriteDBCommitmentHistoryEnabled(tx, cfg.KeepExecutionProofs); err != nil {
 		return err
 	}
-	logger.Warn("enabling commitment history. this is an experimental flag so run at your own risk!", "enabled", cfg.KeepExecutionProofs)
+	if cfg.KeepExecutionProofs {
+		logger.Warn("[experiment] enabling commitment history. this is an experimental flag so run at your own risk!", "enabled", cfg.KeepExecutionProofs)
+	}
 	return nil
 }
 
@@ -300,6 +305,15 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 	latestBlockBuiltStore := builder.NewLatestBlockBuiltStore()
 
 	if err := rawChainDB.Update(context.Background(), func(tx kv.RwTx) error {
+		var notChanged bool
+		notChanged, config.PersistReceiptsCacheV2, err = kvcfg.PersistReceipts.EnsureNotChanged(tx, config.PersistReceiptsCacheV2)
+		if err != nil {
+			return err
+		}
+		if !notChanged {
+			return fmt.Errorf("cli flag changed: %s", kvcfg.PersistReceipts)
+		}
+
 		if err := checkAndSetCommitmentHistoryFlag(tx, logger, dirs, config); err != nil {
 			return err
 		}
@@ -342,7 +356,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 	var genesis *types.Block
 	if err := rawChainDB.Update(context.Background(), func(tx kv.RwTx) error {
 
-		genesisConfig, err := rawdb.ReadGenesis(tx)
+		genesisConfig, err := core.ReadGenesis(tx)
 		if err != nil {
 			return err
 		}
@@ -360,7 +374,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 			panic(err)
 		}
 		genesisSpec := config.Genesis
-		if h != (libcommon.Hash{}) { // fallback to db content
+		if h != (common.Hash{}) { // fallback to db content
 			genesisSpec = nil
 		}
 		var genesisErr error
@@ -698,6 +712,23 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 		return nil, err
 	}
 
+	var ethashApi *ethash.API
+	if casted, ok := backend.engine.(*ethash.Ethash); ok {
+		ethashApi = casted.APIs(nil)[1].Service.(*ethash.API)
+	}
+
+	backend.miningRPC = privateapi2.NewMiningServer(ctx, backend, ethashApi, logger)
+	backend.ethBackendRPC = privateapi2.NewEthBackendServer(
+		ctx,
+		backend,
+		backend.chainDB,
+		backend.notifications,
+		blockReader,
+		logger,
+		latestBlockBuiltStore,
+		chainConfig,
+	)
+
 	backend.stateDiffClient = direct.NewStateDiffClientDirect(kvRPC)
 	var txnProvider txnprovider.TxnProvider
 	if config.TxPool.Disable {
@@ -719,6 +750,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 			backend.stateDiffClient,
 			blockBuilderNotifyNewTxns,
 			logger,
+			direct.NewEthBackendClientDirect(backend.ethBackendRPC),
 		)
 		if err != nil {
 			return nil, err
@@ -727,22 +759,6 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 		txnProvider = backend.txPool
 	}
 
-	var ethashApi *ethash.API
-	if casted, ok := backend.engine.(*ethash.Ethash); ok {
-		ethashApi = casted.APIs(nil)[1].Service.(*ethash.API)
-	}
-
-	backend.miningRPC = privateapi2.NewMiningServer(ctx, backend, ethashApi, logger)
-	backend.ethBackendRPC = privateapi2.NewEthBackendServer(
-		ctx,
-		backend,
-		backend.chainDB,
-		backend.notifications,
-		blockReader,
-		logger,
-		latestBlockBuiltStore,
-		chainConfig,
-	)
 	httpRpcCfg := stack.Config().Http
 	ethRpcClient, txPoolRpcClient, miningRpcClient, rpcDaemonStateCache, rpcFilters := rpcdaemoncli.EmbeddedServices(
 		ctx,
@@ -818,8 +834,8 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 
 	var (
 		snapDb     kv.RwDB
-		recents    *lru.ARCCache[libcommon.Hash, *bor.Snapshot]
-		signatures *lru.ARCCache[libcommon.Hash, libcommon.Address]
+		recents    *lru.ARCCache[common.Hash, *bor.Snapshot]
+		signatures *lru.ARCCache[common.Hash, common.Address]
 	)
 	if bor, ok := backend.engine.(*bor.Bor); ok {
 		snapDb = bor.DB
@@ -1087,7 +1103,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 			logger, backend.sentriesClient.Hd, executionRpc,
 			backend.sentriesClient.Bd, backend.sentriesClient.BroadcastNewBlock, backend.sentriesClient.SendBodyRequest, blockReader,
 			backend.chainDB, chainConfig, tmpdir, config.Sync),
-		config.InternalCL, // If the chain supports the engine API, then we should not make the server fail.
+		config.InternalCL && !config.CaplinConfig.EnableEngineAPI, // If the chain supports the engine API, then we should not make the server fail.
 		false,
 		config.Miner.EnabledPOS,
 		!config.PolygonPosSingleSlotFinality,
@@ -1097,6 +1113,19 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 	if config.InternalCL && (clparams.EmbeddedSupported(config.NetworkID) || config.CaplinConfig.IsDevnet()) {
 		config.CaplinConfig.NetworkId = clparams.NetworkType(config.NetworkID)
 		config.CaplinConfig.LoopBlockLimit = uint64(config.LoopBlockLimit)
+		if config.CaplinConfig.EnableEngineAPI {
+			jwtSecretHex, err := os.ReadFile(httpRpcCfg.JWTSecretPath)
+			if err != nil {
+				logger.Error("failed to read jwt secret", "err", err, "path", httpRpcCfg.JWTSecretPath)
+				return nil, err
+			}
+			jwtSecret := common.FromHex(strings.TrimSpace(string(jwtSecretHex)))
+			executionEngine, err = executionclient.NewExecutionClientRPC(jwtSecret, httpRpcCfg.AuthRpcHTTPListenAddress, httpRpcCfg.AuthRpcPort)
+			if err != nil {
+				logger.Error("failed to create execution client", "err", err)
+				return nil, err
+			}
+		}
 		go func() {
 			eth1Getter := getters.NewExecutionSnapshotReader(ctx, blockReader, backend.chainDB)
 			if err := caplin1.RunCaplinService(ctx, executionEngine, config.CaplinConfig, dirs, eth1Getter, backend.downloaderClient, creds, segmentsBuildLimiter); err != nil {
@@ -1179,7 +1208,7 @@ func (s *Ethereum) Init(stack *node.Node, config *ethconfig.Config, chainConfig 
 		s.sentriesClient.Hd.StartPoSDownloader(s.sentryCtx, s.sentriesClient.SendHeaderRequest, s.sentriesClient.Penalize)
 	}
 
-	emptyBadHash := config.BadBlockHash == libcommon.Hash{}
+	emptyBadHash := config.BadBlockHash == common.Hash{}
 	if !emptyBadHash {
 		if err = chainKv.View(ctx, func(tx kv.Tx) error {
 			badBlockHeader, hErr := rawdb.ReadHeaderByHash(tx, config.BadBlockHash)
@@ -1257,15 +1286,15 @@ func (s *Ethereum) APIs() []rpc.API {
 	return s.apiList
 }
 
-func (s *Ethereum) Etherbase() (eb libcommon.Address, err error) {
+func (s *Ethereum) Etherbase() (eb common.Address, err error) {
 	s.lock.RLock()
 	etherbase := s.etherbase
 	s.lock.RUnlock()
 
-	if etherbase != (libcommon.Address{}) {
+	if etherbase != (common.Address{}) {
 		return etherbase, nil
 	}
-	return libcommon.Address{}, errors.New("etherbase must be explicitly specified")
+	return common.Address{}, errors.New("etherbase must be explicitly specified")
 }
 
 // StartMining starts the miner with the given number of CPU threads. If mining
@@ -1304,7 +1333,7 @@ func (s *Ethereum) StartMining(ctx context.Context, db kv.RwDB, stateDiffClient 
 			return fmt.Errorf("signer missing: %w", err)
 		}
 		if borcfg != nil {
-			borcfg.Authorize(eb, func(_ libcommon.Address, mimeType string, message []byte) ([]byte, error) {
+			borcfg.Authorize(eb, func(_ common.Address, mimeType string, message []byte) ([]byte, error) {
 				return crypto.Sign(crypto.Keccak256(message), miner.MiningConfig.SigKey)
 			})
 
@@ -1322,7 +1351,7 @@ func (s *Ethereum) StartMining(ctx context.Context, db kv.RwDB, stateDiffClient 
 				}
 			}
 		} else if s.chainConfig.Consensus == chain.CliqueConsensus {
-			s.engine.(*clique.Clique).Authorize(eb, func(_ libcommon.Address, _ string, msg []byte) ([]byte, error) {
+			s.engine.(*clique.Clique).Authorize(eb, func(_ common.Address, _ string, msg []byte) ([]byte, error) {
 				return crypto.Sign(crypto.Keccak256(msg), miner.MiningConfig.SigKey)
 			})
 		} else {
@@ -1335,7 +1364,7 @@ func (s *Ethereum) StartMining(ctx context.Context, db kv.RwDB, stateDiffClient 
 		// this assumes in this mode we're only running a single validator
 
 		if s.chainConfig.ChainName == networkname.BorDevnet && s.config.WithoutHeimdall {
-			borcfg.Authorize(eb, func(addr libcommon.Address, _ string, _ []byte) ([]byte, error) {
+			borcfg.Authorize(eb, func(addr common.Address, _ string, _ []byte) ([]byte, error) {
 				return nil, &valset.UnauthorizedSignerError{Number: 0, Signer: addr.Bytes()}
 			})
 		}
@@ -1421,7 +1450,7 @@ func (s *Ethereum) StartMining(ctx context.Context, db kv.RwDB, stateDiffClient 
 				case err := <-errc:
 					working = false
 					hasWork = false
-					if errors.Is(err, libcommon.ErrStopped) {
+					if errors.Is(err, common.ErrStopped) {
 						return
 					}
 					if err != nil {
@@ -1547,6 +1576,9 @@ func (s *Ethereum) setUpSnapDownloader(ctx context.Context, downloaderCfg *downl
 		if err != nil {
 			return err
 		}
+
+		s.downloader.HandleTorrentClientStatus()
+
 		bittorrentServer, err := downloader.NewGrpcServer(s.downloader)
 		if err != nil {
 			return fmt.Errorf("new server: %w", err)
@@ -1601,14 +1633,20 @@ func setUpBlockReader(ctx context.Context, db kv.RwDB, dirs datadir.Dirs, snConf
 		}
 	}
 	blockReader := freezeblocks.NewBlockReader(allSnapshots, allBorSnapshots, heimdallStore, bridgeStore)
-	agg, err := libstate.NewAggregator(ctx, dirs, config3.DefaultStepSize, db, logger)
+
+	createNewSaltFileIfNeeded := snConfig.Snapshot.NoDownloader || snConfig.Snapshot.DisableDownloadE3
+	salt, err := libstate.GetStateIndicesSalt(dirs, createNewSaltFileIfNeeded, logger)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, nil, err
+	}
+	agg, err := libstate.NewAggregator2(ctx, dirs, config3.DefaultStepSize, salt, db, logger)
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, nil, err
 	}
 	agg.SetSnapshotBuildSema(blockSnapBuildSema)
 	agg.SetProduceMod(snConfig.Snapshot.ProduceE3)
 
-	allSegmentsDownloadComplete, err := rawdb.AllSegmentsDownloadCompleteFromDB(db)
+	allSegmentsDownloadComplete, err := core.AllSegmentsDownloadCompleteFromDB(db)
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, nil, err
 	}
@@ -1690,7 +1728,7 @@ func (s *Ethereum) Start() error {
 			// which make use of snapshots and expect them to be initialize
 			// TODO: get the snapshots to call the downloader directly - which will avoid this
 			go func() {
-				err := stages2.StageLoopIteration(s.sentryCtx, s.chainDB, wrap.TxContainer{}, s.polygonDownloadSync, true, true, s.logger, s.blockReader, hook)
+				err := stages2.StageLoopIteration(s.sentryCtx, s.chainDB, wrap.NewTxContainer(nil, nil), s.polygonDownloadSync, true, true, s.logger, s.blockReader, hook)
 
 				if err != nil && !errors.Is(err, context.Canceled) {
 					s.logger.Error("[polygon.sync] downloader stage crashed - stopping node", "err", err)
@@ -1789,7 +1827,7 @@ func (s *Ethereum) Stop() error {
 		case <-shutdownDone:
 		}
 	}
-	libcommon.SafeClose(s.sentriesClient.Hd.QuitPoWMining)
+	common.SafeClose(s.sentriesClient.Hd.QuitPoWMining)
 	_ = s.engine.Close()
 	if s.waitForStageLoopStop != nil {
 		<-s.waitForStageLoopStop

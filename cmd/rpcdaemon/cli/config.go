@@ -37,9 +37,11 @@ import (
 	grpcHealth "google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
+	"github.com/erigontech/erigon-db/rawdb"
 	"github.com/erigontech/erigon-lib/chain"
-	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/datadir"
+	"github.com/erigontech/erigon-lib/common/dir"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/common/paths"
 	"github.com/erigontech/erigon-lib/config3"
@@ -57,16 +59,17 @@ import (
 	"github.com/erigontech/erigon-lib/kv/temporal"
 	"github.com/erigontech/erigon-lib/log/v3"
 	libstate "github.com/erigontech/erigon-lib/state"
+	"github.com/erigontech/erigon-lib/state/stats"
+	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/cli/httpcfg"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/graphql"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/health"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/rpcservices"
 	"github.com/erigontech/erigon/cmd/utils"
 	"github.com/erigontech/erigon/cmd/utils/flags"
-	"github.com/erigontech/erigon/core/rawdb"
+	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/tracing"
-	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
 	"github.com/erigontech/erigon/eth/ethconfig"
 	"github.com/erigontech/erigon/execution/consensus"
@@ -110,7 +113,7 @@ type HeimdallReader interface {
 
 type BridgeReader interface {
 	Events(ctx context.Context, blockNum uint64) ([]*types.Message, error)
-	EventTxnLookup(ctx context.Context, borTxHash libcommon.Hash) (uint64, bool, error)
+	EventTxnLookup(ctx context.Context, borTxHash common.Hash) (uint64, bool, error)
 	Close()
 }
 
@@ -279,7 +282,7 @@ func checkDbCompatibility(ctx context.Context, db kv.RoDB) error {
 	defer compatTx.Rollback()
 	major, minor, patch, ok, err := rawdb.ReadDBSchemaVersion(compatTx)
 	if err != nil {
-		return fmt.Errorf("read version for DB schema compability check: %w", compatErr)
+		return fmt.Errorf("read version for DB schema compability check: %w", err)
 	}
 	if ok {
 		var compatible bool
@@ -298,6 +301,23 @@ func checkDbCompatibility(ctx context.Context, db kv.RoDB) error {
 		}
 		log.Info("DB schemas compatible", "reader", fmt.Sprintf("%d.%d.%d", dbSchemaVersion.Major, dbSchemaVersion.Minor, dbSchemaVersion.Patch),
 			"database", fmt.Sprintf("%d.%d.%d", major, minor, patch))
+	}
+
+	return nil
+}
+
+func checkSaltFilesExist(dirs datadir.Dirs) error {
+	exists, err := dir.FileExist(filepath.Join(dirs.Snap, "salt-blocks.txt"))
+	if err != nil {
+		return err
+	}
+	exists2, err := dir.FileExist(filepath.Join(dirs.Snap, "salt-state.txt"))
+	if err != nil {
+		return err
+	}
+
+	if !exists && !exists2 {
+		return errors.New("salt files not found")
 	}
 
 	return nil
@@ -374,6 +394,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 	if cfg.WithDatadir {
 		// Opening all databases in Accede and non-Readonly modes. Here is the motivation:
 		// Rpcdaemon must provide 2 features:
+		//     0. must not start on empty directory (which means when starting from scratch, erigon must be started first and some files downloaded)
 		//     1. ability to start even if Erigon is down (to prevent cascade outage).
 		//     2. don't create databases by itself - because it doesn't know right parameters (Erigon may have cli flags: pagesize, etc...)
 		// Some databases (consensus, txpool, downloader) are woring in SafeNoSync mode - in this mode
@@ -381,6 +402,12 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 		// Accede mode preventing db-creation:
 		//    at first start RpcDaemon may start earlier than Erigon
 		//    Accede mode will check db existence (may wait with retries). It's ok to fail in this case - some supervisor will restart us.
+
+		// using salt files as proxy for empty directory or not
+		existErr := checkSaltFilesExist(cfg.Dirs)
+		if existErr != nil {
+			return nil, nil, nil, nil, nil, nil, nil, ff, nil, nil, fmt.Errorf("directory is empty: %v", existErr)
+		}
 		logger.Warn("Opening chain db", "path", cfg.Dirs.Chaindata)
 		limiter := semaphore.NewWeighted(roTxLimit)
 		rawDB, err := kv2.New(kv.ChainDB, logger).RoTxsLimiter(limiter).Path(cfg.Dirs.Chaindata).Accede(true).Open(ctx)
@@ -396,7 +423,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 			if err != nil {
 				return err
 			}
-			cc, err = rawdb.ReadChainConfig(tx, genesisHash)
+			cc, err = core.ReadChainConfig(tx, genesisHash)
 			if err != nil {
 				return err
 			}
@@ -438,7 +465,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 
 		//TODO - its probably better to use:  <-blockReader.Ready() here - but it depends how
 		//this is called at a process level
-		allSegmentsDownloadComplete, err := rawdb.AllSegmentsDownloadCompleteFromDB(rawDB)
+		allSegmentsDownloadComplete, err := core.AllSegmentsDownloadCompleteFromDB(rawDB)
 		if err != nil {
 			return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
@@ -453,7 +480,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 			rawDB.View(context.Background(), func(tx kv.Tx) error {
 				aggTx := agg.BeginFilesRo()
 				defer aggTx.Close()
-				aggTx.LogStats(tx, func(endTxNumMinimax uint64) (uint64, error) {
+				stats.LogStats(aggTx, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
 					_, histBlockNumProgress, err := txNumsReader.FindBlockNum(tx, endTxNumMinimax)
 					return histBlockNumProgress, err
 				})
@@ -489,7 +516,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 					rawDB.View(context.Background(), func(tx kv.Tx) error {
 						ac := agg.BeginFilesRo()
 						defer ac.Close()
-						ac.LogStats(tx, func(endTxNumMinimax uint64) (uint64, error) {
+						stats.LogStats(ac, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
 							_, histBlockNumProgress, err := txNumsReader.FindBlockNum(tx, endTxNumMinimax)
 							return histBlockNumProgress, err
 						})
@@ -898,7 +925,7 @@ func ObtainJWTSecret(cfg *httpcfg.HttpCfg, logger log.Logger) ([]byte, error) {
 		cfg.JWTSecretPath = "jwt.hex"
 	}
 	if data, err := os.ReadFile(cfg.JWTSecretPath); err == nil {
-		jwtSecret := libcommon.FromHex(strings.TrimSpace(string(data)))
+		jwtSecret := common.FromHex(strings.TrimSpace(string(data)))
 		if len(jwtSecret) == 32 {
 			return jwtSecret, nil
 		}
@@ -1015,7 +1042,7 @@ func (e *remoteConsensusEngine) init(db kv.RoDB, blockReader services.FullBlockR
 		if err != nil {
 			return err
 		}
-		cc, err = rawdb.ReadChainConfig(tx, genesisHash)
+		cc, err = core.ReadChainConfig(tx, genesisHash)
 		if err != nil {
 			return err
 		}
@@ -1063,15 +1090,15 @@ func (e *remoteConsensusEngine) init(db kv.RoDB, blockReader services.FullBlockR
 	return nil
 }
 
-func (e *remoteConsensusEngine) Author(header *types.Header) (libcommon.Address, error) {
+func (e *remoteConsensusEngine) Author(header *types.Header) (common.Address, error) {
 	if err := e.validateEngineReady(); err != nil {
-		return libcommon.Address{}, err
+		return common.Address{}, err
 	}
 
 	return e.engine.Author(header)
 }
 
-func (e *remoteConsensusEngine) IsServiceTransaction(sender libcommon.Address, syscall consensus.SystemCall) bool {
+func (e *remoteConsensusEngine) IsServiceTransaction(sender common.Address, syscall consensus.SystemCall) bool {
 	if err := e.validateEngineReady(); err != nil {
 		panic(err)
 	}
@@ -1151,11 +1178,11 @@ func (e *remoteConsensusEngine) Seal(_ consensus.ChainHeaderReader, _ *types.Blo
 	panic("remoteConsensusEngine.Seal not supported")
 }
 
-func (e *remoteConsensusEngine) SealHash(_ *types.Header) libcommon.Hash {
+func (e *remoteConsensusEngine) SealHash(_ *types.Header) common.Hash {
 	panic("remoteConsensusEngine.SealHash not supported")
 }
 
-func (e *remoteConsensusEngine) CalcDifficulty(_ consensus.ChainHeaderReader, _ uint64, _ uint64, _ *big.Int, _ uint64, _ libcommon.Hash, _ libcommon.Hash, _ uint64) *big.Int {
+func (e *remoteConsensusEngine) CalcDifficulty(_ consensus.ChainHeaderReader, _ uint64, _ uint64, _ *big.Int, _ uint64, _ common.Hash, _ common.Hash, _ uint64) *big.Int {
 	panic("remoteConsensusEngine.CalcDifficulty not supported")
 }
 

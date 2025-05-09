@@ -39,7 +39,9 @@ import (
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sync/semaphore"
 
+	"github.com/erigontech/erigon-db/rawdb/blockio"
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/compress"
 	"github.com/erigontech/erigon-lib/common/datadir"
 	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/dir"
@@ -58,10 +60,10 @@ import (
 	"github.com/erigontech/erigon-lib/recsplit"
 	"github.com/erigontech/erigon-lib/seg"
 	libstate "github.com/erigontech/erigon-lib/state"
+	"github.com/erigontech/erigon-lib/state/stats"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cmd/hack/tool/fromdb"
 	"github.com/erigontech/erigon/cmd/utils"
-	"github.com/erigontech/erigon/core/rawdb/blockio"
 	coresnaptype "github.com/erigontech/erigon/core/snaptype"
 	"github.com/erigontech/erigon/diagnostics"
 	"github.com/erigontech/erigon/eth/ethconfig"
@@ -146,8 +148,6 @@ var snapshotCommand = cli.Command{
 			Flags: joinFlags([]cli.Flag{
 				&utils.DataDirFlag,
 				&SnapshotFromFlag,
-				&SnapshotToFlag,
-				&SnapshotEveryFlag,
 			}),
 		},
 		{
@@ -218,7 +218,7 @@ var snapshotCommand = cli.Command{
 				&utils.DataDirFlag,
 				&cli.StringFlag{Name: "step"},
 				&cli.BoolFlag{Name: "latest"},
-				&cli.StringFlag{Name: "domain"},
+				&cli.StringSliceFlag{Name: "domain"},
 			},
 			),
 		},
@@ -287,16 +287,6 @@ var (
 		Name:  "from",
 		Usage: "From block number",
 		Value: 0,
-	}
-	SnapshotToFlag = cli.Uint64Flag{
-		Name:  "to",
-		Usage: "To block number. Zero - means unlimited.",
-		Value: 0,
-	}
-	SnapshotEveryFlag = cli.Uint64Flag{
-		Name:  "every",
-		Usage: "Do operation every N blocks",
-		Value: 1_000,
 	}
 	SnapshotRebuildFlag = cli.BoolFlag{
 		Name:  "rebuild",
@@ -402,21 +392,29 @@ func doRmStateSnapshots(cliCtx *cli.Context) error {
 		fmt.Printf("removed %d state segments files\n", removed)
 	}
 	if cliCtx.IsSet("domain") {
-		domainToRemove, err := kv.String2Domain(cliCtx.String("domain"))
-		if err != nil {
-			return err
-		}
-		var removed int
-		for _, res := range files {
-			if !strings.Contains(res.Name(), domainToRemove.String()) {
-				continue
+		domainNames := cliCtx.StringSlice("domain")
+		for _, domainName := range domainNames {
+			_, err := kv.String2InvertedIdx(domainName)
+			if err != nil {
+				_, err = kv.String2Domain(domainName)
+				if err != nil {
+					return err
+				}
 			}
-			if err := os.Remove(res.Path); err != nil {
-				return fmt.Errorf("failed to remove %s: %w", res.Path, err)
+
+			var removed int
+			for _, res := range files {
+				if !strings.Contains(res.Name(), domainName) {
+					continue
+				}
+				if err := os.Remove(res.Path); err != nil {
+					return fmt.Errorf("failed to remove %s: %w", res.Path, err)
+				}
+				removed++
 			}
-			removed++
+			fmt.Printf("removed %d state segments files of %s\n", removed, domainName)
 		}
-		fmt.Printf("removed %d state segments files\n", removed)
+
 	}
 
 	return nil
@@ -487,6 +485,8 @@ func doDebugKey(cliCtx *cli.Context) error {
 		domain, idx = kv.CommitmentDomain, kv.CommitmentHistoryIdx
 	case "receipt":
 		domain, idx = kv.ReceiptDomain, kv.ReceiptHistoryIdx
+	case "rcache":
+		domain, idx = kv.RCacheDomain, kv.RCacheHistoryIdx
 	default:
 		panic(ds)
 	}
@@ -583,15 +583,15 @@ func doIntegrity(cliCtx *cli.Context) error {
 				return err
 			}
 		case integrity.BorSpans:
-			if err := integrity.ValidateBorSpans(logger, dirs, borSnaps, failFast); err != nil {
+			if err := integrity.ValidateBorSpans(ctx, logger, dirs, borSnaps, failFast); err != nil {
 				return err
 			}
 		case integrity.BorCheckpoints:
-			if err := integrity.ValidateBorCheckpoints(logger, dirs, borSnaps, failFast); err != nil {
+			if err := integrity.ValidateBorCheckpoints(ctx, logger, dirs, borSnaps, failFast); err != nil {
 				return err
 			}
 		case integrity.BorMilestones:
-			if err := integrity.ValidateBorMilestones(logger, dirs, borSnaps, failFast); err != nil {
+			if err := integrity.ValidateBorMilestones(ctx, logger, dirs, borSnaps, failFast); err != nil {
 				return err
 			}
 		case integrity.ReceiptsNoDups:
@@ -698,18 +698,12 @@ func checkIfStateSnapshotsPublishable(dirs datadir.Dirs) error {
 		if path == dirs.SnapDomain {
 			return nil
 		}
-		rangeString := strings.Split(info.Name(), ".")[1]
-		rangeNums := strings.Split(rangeString, "-")
-		// convert the range to uint64
-		from, err := strconv.ParseUint(rangeNums[0], 10, 64)
-		if err != nil {
-			return fmt.Errorf("failed to parse to %s: %w", rangeNums[1], err)
-		}
 
-		to, err := strconv.ParseUint(rangeNums[1], 10, 64)
-		if err != nil {
-			return fmt.Errorf("failed to parse to %s: %w", rangeNums[1], err)
+		res, _, ok := snaptype.ParseFileName(dirs.SnapDomain, info.Name())
+		if !ok {
+			return fmt.Errorf("failed to parse filename %s: %w", info.Name(), err)
 		}
+		from, to := res.From, res.To
 		maxStep = max(maxStep, to)
 
 		if !strings.HasSuffix(info.Name(), ".kv") || !strings.Contains(info.Name(), "accounts") {
@@ -717,15 +711,23 @@ func checkIfStateSnapshotsPublishable(dirs datadir.Dirs) error {
 		}
 
 		stepSum += to - from
+
+		oldVersion := res.Version
 		// do a range check over all snapshots types (sanitizes domain and history folder)
 		for _, snapType := range kv.StateDomains {
+			newVersion := libstate.Schema.GetDomainCfg(snapType).GetVersions().Domain.DataKV
 			expectedFileName := strings.Replace(info.Name(), "accounts", snapType.String(), 1)
+			expectedFileName = snaptype.ReplaceVersion(expectedFileName, oldVersion, newVersion)
 			if _, err := os.Stat(filepath.Join(dirs.SnapDomain, expectedFileName)); err != nil {
 				return fmt.Errorf("missing file %s at path %s", expectedFileName, filepath.Join(dirs.SnapDomain, expectedFileName))
 			}
+
+			oldVersion = newVersion
 			// check that the index file exist
-			if libstate.Schema[snapType].AccessorList.Has(libstate.AccessorBTree) {
+			if libstate.Schema.GetDomainCfg(snapType).Accessors.Has(libstate.AccessorBTree) {
+				newVersion = libstate.Schema.GetDomainCfg(snapType).GetVersions().Domain.AccessorBT
 				fileName := strings.Replace(expectedFileName, ".kv", ".bt", 1)
+				fileName = snaptype.ReplaceVersion(fileName, oldVersion, newVersion)
 				exists, err := dir.FileExist(filepath.Join(dirs.SnapDomain, fileName))
 				if err != nil {
 					return err
@@ -734,8 +736,10 @@ func checkIfStateSnapshotsPublishable(dirs datadir.Dirs) error {
 					return fmt.Errorf("missing file %s", fileName)
 				}
 			}
-			if libstate.Schema[snapType].AccessorList.Has(libstate.AccessorExistence) {
+			if libstate.Schema.GetDomainCfg(snapType).Accessors.Has(libstate.AccessorExistence) {
+				newVersion = libstate.Schema.GetDomainCfg(snapType).GetVersions().Domain.AccessorKVEI
 				fileName := strings.Replace(expectedFileName, ".kv", ".kvei", 1)
+				fileName = snaptype.ReplaceVersion(fileName, oldVersion, newVersion)
 				exists, err := dir.FileExist(filepath.Join(dirs.SnapDomain, fileName))
 				if err != nil {
 					return err
@@ -744,8 +748,10 @@ func checkIfStateSnapshotsPublishable(dirs datadir.Dirs) error {
 					return fmt.Errorf("missing file %s", fileName)
 				}
 			}
-			if libstate.Schema[snapType].AccessorList.Has(libstate.AccessorHashMap) {
+			if libstate.Schema.GetDomainCfg(snapType).Accessors.Has(libstate.AccessorHashMap) {
+				newVersion = libstate.Schema.GetDomainCfg(snapType).GetVersions().Domain.AccessorKVI
 				fileName := strings.Replace(expectedFileName, ".kv", ".kvi", 1)
+				fileName = snaptype.ReplaceVersion(fileName, oldVersion, newVersion)
 				exists, err := dir.FileExist(filepath.Join(dirs.SnapDomain, fileName))
 				if err != nil {
 					return err
@@ -772,14 +778,12 @@ func checkIfStateSnapshotsPublishable(dirs datadir.Dirs) error {
 		if path == dirs.SnapIdx {
 			return nil
 		}
-		rangeString := strings.Split(info.Name(), ".")[1]
-		rangeNums := strings.Split(rangeString, "-")
-
-		to, err := strconv.ParseUint(rangeNums[1], 10, 64)
-		if err != nil {
-			return fmt.Errorf("failed to parse to %s: %w", rangeNums[1], err)
+		res, _, ok := snaptype.ParseFileName(dirs.SnapIdx, info.Name())
+		if !ok {
+			return fmt.Errorf("failed to parse filename %s: %w", info.Name(), err)
 		}
-		maxStep = max(maxStep, to)
+
+		maxStep = max(maxStep, res.To)
 
 		if !strings.HasSuffix(info.Name(), ".ef") || !strings.Contains(info.Name(), "accounts") {
 			return nil
@@ -789,24 +793,36 @@ func checkIfStateSnapshotsPublishable(dirs datadir.Dirs) error {
 
 		// do a range check over all snapshots types (sanitizes domain and history folder)
 		for _, snapType := range []string{"accounts", "storage", "code", "logtopics", "logaddrs", "tracesfrom", "tracesto"} {
+			versioned, err := libstate.Schema.GetVersioned(snapType)
+			if err != nil {
+				return err
+			}
+			oldVersion := versioned.GetVersions().II.DataEF
 			expectedFileName := strings.Replace(info.Name(), "accounts", snapType, 1)
+
 			if _, err := os.Stat(filepath.Join(dirs.SnapIdx, expectedFileName)); err != nil {
 				return fmt.Errorf("missing file %s at path %s", expectedFileName, filepath.Join(dirs.SnapIdx, expectedFileName))
 			}
 			// Check accessors
+			newVersion := versioned.GetVersions().II.AccessorEFI
 			efiFileName := strings.Replace(expectedFileName, ".ef", ".efi", 1)
+			efiFileName = snaptype.ReplaceVersion(efiFileName, oldVersion, newVersion)
 			if _, err := os.Stat(filepath.Join(dirs.SnapAccessors, efiFileName)); err != nil {
 				return fmt.Errorf("missing file %s at path %s", efiFileName, filepath.Join(dirs.SnapAccessors, efiFileName))
 			}
 			if !slices.Contains(viTypes, snapType) {
 				continue
 			}
+			newVersion = versioned.GetVersions().Hist.AccessorVI
 			viFileName := strings.Replace(expectedFileName, ".ef", ".vi", 1)
+			viFileName = snaptype.ReplaceVersion(viFileName, oldVersion, newVersion)
 			if _, err := os.Stat(filepath.Join(dirs.SnapAccessors, viFileName)); err != nil {
 				return fmt.Errorf("missing file %s at path %s", viFileName, filepath.Join(dirs.SnapAccessors, viFileName))
 			}
+			newVersion = versioned.GetVersions().Hist.DataV
 			// check that .v
 			vFileName := strings.Replace(expectedFileName, ".ef", ".v", 1)
+			vFileName = snaptype.ReplaceVersion(vFileName, oldVersion, newVersion)
 			if _, err := os.Stat(filepath.Join(dirs.SnapHistory, vFileName)); err != nil {
 				return fmt.Errorf("missing file %s at path %s", vFileName, filepath.Join(dirs.SnapHistory, vFileName))
 			}
@@ -851,13 +867,13 @@ func doBlockSnapshotsRangeCheck(snapDir string, suffix string, snapType string) 
 	// Check that there are no gaps
 	for i := 1; i < len(intervals); i++ {
 		if intervals[i].from != intervals[i-1].to {
-			return fmt.Errorf("gap between %d and %d. snaptype: %s", intervals[i-1].to, intervals[i].from, snapType)
+			return fmt.Errorf("gap between (%d-%d) and (%d-%d). snaptype: %s", intervals[i-1].from, intervals[i-1].to, intervals[i].from, intervals[i].to, snapType)
 		}
 	}
 	// Check that there are no overlaps
 	for i := 1; i < len(intervals); i++ {
 		if intervals[i].from < intervals[i-1].to {
-			return fmt.Errorf("overlap between %d and %d. snaptype: %s", intervals[i-1].to, intervals[i].from, snapType)
+			return fmt.Errorf("overlap between (%d-%d) and (%d-%d). snaptype: %s", intervals[i-1].from, intervals[i-1].to, intervals[i].from, intervals[i].to, snapType)
 		}
 	}
 
@@ -962,8 +978,8 @@ func doDiff(cliCtx *cli.Context) error {
 	}
 	defer dst.Close()
 
-	defer src.EnableReadAhead().DisableReadAhead()
-	defer dst.EnableReadAhead().DisableReadAhead()
+	defer src.MadvSequential().DisableReadAhead()
+	defer dst.MadvSequential().DisableReadAhead()
 
 	i := 0
 	srcG, dstG := src.MakeGetter(), dst.MakeGetter()
@@ -1050,7 +1066,7 @@ func doDecompressSpeed(cliCtx *cli.Context) error {
 	}
 	defer decompressor.Close()
 	func() {
-		defer decompressor.EnableReadAhead().DisableReadAhead()
+		defer decompressor.MadvSequential().DisableReadAhead()
 
 		t := time.Now()
 		g := decompressor.MakeGetter()
@@ -1061,7 +1077,7 @@ func doDecompressSpeed(cliCtx *cli.Context) error {
 		logger.Info("decompress speed", "took", time.Since(t))
 	}()
 	func() {
-		defer decompressor.EnableReadAhead().DisableReadAhead()
+		defer decompressor.MadvSequential().DisableReadAhead()
 
 		t := time.Now()
 		g := decompressor.MakeGetter()
@@ -1109,7 +1125,7 @@ func doIndicesCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	if err := caplinSnaps.BuildMissingIndices(ctx, logger); err != nil {
 		return err
 	}
-	err = agg.BuildMissedIndices(ctx, estimate.IndexSnapshot.Workers())
+	err = agg.BuildMissedAccessors(ctx, estimate.IndexSnapshot.Workers())
 	if err != nil {
 		return err
 	}
@@ -1181,6 +1197,7 @@ func openSnaps(ctx context.Context, cfg ethconfig.BlocksFreezing, dirs datadir.D
 	if chainConfig.Bor != nil {
 		const PolygonSync = true
 		if PolygonSync {
+			borSnaps.DownloadComplete() // mark as ready
 			bridgeStore = bridge.NewSnapshotStore(bridge.NewMdbxStore(dirs.DataDir, logger, true, 0), borSnaps, chainConfig.Bor)
 			heimdallStore = heimdall.NewSnapshotStore(heimdall.NewMdbxStore(logger, dirs.DataDir, true, 0), borSnaps)
 		} else {
@@ -1205,7 +1222,7 @@ func openSnaps(ctx context.Context, cfg ethconfig.BlocksFreezing, dirs datadir.D
 	err = chainDB.View(ctx, func(tx kv.Tx) error {
 		ac := agg.BeginFilesRo()
 		defer ac.Close()
-		ac.LogStats(tx, func(endTxNumMinimax uint64) (uint64, error) {
+		stats.LogStats(ac, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
 			_, histBlockNumProgress, err := rawdbv3.TxNums.WithCustomReadTxNumFunc(freezeblocks.ReadTxNumFuncFromBlockReader(ctx, blockReader)).FindBlockNum(tx, endTxNumMinimax)
 			return histBlockNumProgress, err
 		})
@@ -1243,7 +1260,7 @@ func doUncompress(cliCtx *cli.Context) error {
 		return err
 	}
 	defer decompressor.Close()
-	defer decompressor.EnableReadAhead().DisableReadAhead()
+	defer decompressor.MadvSequential().DisableReadAhead()
 
 	wr := bufio.NewWriterSize(os.Stdout, int(128*datasize.MB))
 	defer wr.Flush()
@@ -1279,6 +1296,12 @@ func doUncompress(cliCtx *cli.Context) error {
 }
 
 func doCompress(cliCtx *cli.Context) error {
+	defer func() {
+		var m runtime.MemStats
+		dbg.ReadMemStats(&m)
+		log.Info("done", "alloc", common.ByteCount(m.Alloc), "sys", common.ByteCount(m.Sys))
+	}()
+
 	dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
 	logger, _, _, _, err := debug.Setup(cliCtx, true /* rootLogger */)
 	if err != nil {
@@ -1294,6 +1317,7 @@ func doCompress(cliCtx *cli.Context) error {
 
 	compressCfg := seg.DefaultCfg
 	compressCfg.Workers = estimate.CompressSnapshot.Workers()
+	compressCfg.MinPatternScore = uint64(dbg.EnvInt("MinPatternScore", int(compressCfg.MinPatternScore)))
 	compressCfg.MinPatternLen = dbg.EnvInt("MinPatternLen", compressCfg.MinPatternLen)
 	compressCfg.MaxPatternLen = dbg.EnvInt("MaxPatternLen", compressCfg.MaxPatternLen)
 	compressCfg.SamplingFactor = uint64(dbg.EnvInt("SamplingFactor", int(compressCfg.SamplingFactor)))
@@ -1310,7 +1334,13 @@ func doCompress(cliCtx *cli.Context) error {
 		compression = seg.CompressNone
 	}
 
-	logger.Info("[compress] file", "datadir", dirs.DataDir, "f", f, "cfg", compressCfg)
+	doSnappyEachWord := dbg.EnvBool("SnappyEachWord", false)
+	doUnSnappyEachWord := dbg.EnvBool("UnSnappyEachWord", false)
+
+	justPrint := dbg.EnvBool("JustPrint", false)
+	concat := dbg.EnvInt("Concat", 0)
+
+	logger.Info("[compress] file", "datadir", dirs.DataDir, "f", f, "cfg", compressCfg, "SnappyEachWord", doSnappyEachWord)
 	c, err := seg.NewCompressor(ctx, "compress", f, dirs.Tmp, compressCfg, log.LvlInfo, logger)
 	if err != nil {
 		return err
@@ -1319,24 +1349,53 @@ func doCompress(cliCtx *cli.Context) error {
 	w := seg.NewWriter(c, compression)
 
 	r := bufio.NewReaderSize(os.Stdin, int(128*datasize.MB))
-	buf := make([]byte, 0, int(1*datasize.MB))
+	word := make([]byte, 0, int(1*datasize.MB))
+	var snappyBuf, unSnappyBuf []byte
+	var concatBuf []byte
+	concatI := 0
+
 	var l uint64
 	for l, err = binary.ReadUvarint(r); err == nil; l, err = binary.ReadUvarint(r) {
-		if cap(buf) < int(l) {
-			buf = make([]byte, l)
-		} else {
-			buf = buf[:l]
-		}
-		if _, err = io.ReadFull(r, buf); err != nil {
-			return err
-		}
-		if err := w.AddWord(buf); err != nil {
-			return err
-		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+
+		if cap(word) < int(l) {
+			word = make([]byte, l)
+		} else {
+			word = word[:l]
+		}
+		if _, err = io.ReadFull(r, word); err != nil {
+			return err
+		}
+
+		if justPrint {
+			fmt.Printf("%x\n\n", word)
+			continue
+		}
+
+		concatI++
+		if concat > 0 {
+			if concatI%concat != 0 {
+				concatBuf = append(concatBuf, word...)
+				continue
+			}
+
+			word = concatBuf
+			concatBuf = concatBuf[:0]
+		}
+
+		snappyBuf, word = compress.EncodeZstdIfNeed(snappyBuf, word, doSnappyEachWord)
+		unSnappyBuf, word, err = compress.DecodeZstdIfNeed(unSnappyBuf, word, doUnSnappyEachWord)
+		if err != nil {
+			return err
+		}
+		_, _ = snappyBuf, unSnappyBuf
+
+		if _, err := w.Write(word); err != nil {
+			return err
 		}
 	}
 	if !errors.Is(err, io.EOF) {
@@ -1348,6 +1407,7 @@ func doCompress(cliCtx *cli.Context) error {
 
 	return nil
 }
+
 func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	logger, _, _, _, err := debug.Setup(cliCtx, true /* rootLogger */)
 	if err != nil {
@@ -1357,8 +1417,6 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	ctx := cliCtx.Context
 
 	from := cliCtx.Uint64(SnapshotFromFlag.Name)
-	to := cliCtx.Uint64(SnapshotToFlag.Name)
-	every := cliCtx.Uint64(SnapshotEveryFlag.Name)
 
 	db := dbCfg(kv.ChainDB, dirs.Chaindata).MustOpen()
 	defer db.Close()
@@ -1385,27 +1443,56 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 
 	//agg.LimitRecentHistoryWithoutFiles(0)
 
-	var forwardProgress uint64
-	if to == 0 {
-		db.View(ctx, func(tx kv.Tx) error {
-			forwardProgress, err = stages.GetStageProgress(tx, stages.Senders)
-			return err
-		})
-		blockReader, _ := br.IO()
-		from2, to2, ok := freezeblocks.CanRetire(forwardProgress, blockReader.FrozenBlocks(), coresnaptype.Enums.Headers, nil)
-		if ok {
-			from, to, every = from2, to2, to2-from2
-		}
-	} else {
-		forwardProgress = to
-	}
-
-	logger.Info("Params", "from", from, "to", to, "every", every)
-	if err := br.RetireBlocks(ctx, from, forwardProgress, log.LvlInfo, nil, nil, nil); err != nil {
+	var to uint64
+	if err := db.View(ctx, func(tx kv.Tx) error {
+		to, err = stages.GetStageProgress(tx, stages.Senders)
+		return err
+	}); err != nil {
 		return err
 	}
 
 	blockReader, _ := br.IO()
+
+	blocksInSnapshots := blockReader.FrozenBlocks()
+
+	if chainConfig.Bor != nil {
+		blocksInSnapshots = min(blocksInSnapshots, blockReader.FrozenBorBlocks())
+	}
+
+	from2, to2, ok := freezeblocks.CanRetire(to, blocksInSnapshots, coresnaptype.Enums.Headers, nil)
+	if ok {
+		from, to = from2, to2
+	}
+	if err := br.RetireBlocks(ctx, from, to, log.LvlInfo, nil, nil, nil); err != nil {
+		return err
+	}
+	if err := blockReader.Snapshots().RemoveOverlaps(); err != nil {
+		return err
+	}
+	if sn := blockReader.BorSnapshots(); sn != nil {
+		if err := sn.RemoveOverlaps(); err != nil {
+			return err
+		}
+	}
+
+	if err := blockReader.Snapshots().RemoveOverlaps(); err != nil {
+		return err
+	}
+	if sn := blockReader.BorSnapshots(); sn != nil {
+		if err := sn.RemoveOverlaps(); err != nil {
+			return err
+		}
+	}
+
+	if err := blockReader.Snapshots().RemoveOverlaps(); err != nil {
+		return err
+	}
+	if sn := blockReader.BorSnapshots(); sn != nil {
+		if err := sn.RemoveOverlaps(); err != nil {
+			return err
+		}
+	}
+
 	deletedBlocks := math.MaxInt // To pass the first iteration
 	allDeletedBlocks := 0
 	for deletedBlocks > 0 { // prune happens by small steps, so need many runs
@@ -1432,12 +1519,8 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	logger.Info("Prune state history")
 	for hasMoreToPrune := true; hasMoreToPrune; {
 		if err := db.Update(ctx, func(tx kv.RwTx) error {
-			ac := tx.(libstate.HasAggTx).AggTx().(*libstate.AggregatorRoTx)
-			hasMoreToPrune, err = ac.PruneSmallBatches(ctx, 2*time.Minute, tx)
-			if err != nil {
-				return err
-			}
-			return nil
+			hasMoreToPrune, err = tx.(kv.TemporalRwTx).Debug().PruneSmallBatches(ctx, 2*time.Minute)
+			return err
 		}); err != nil {
 			return err
 		}
@@ -1445,7 +1528,7 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 
 	logger.Info("Work on state history snapshots")
 	indexWorkers := estimate.IndexSnapshot.Workers()
-	if err = agg.BuildMissedIndices(ctx, indexWorkers); err != nil {
+	if err = agg.BuildMissedAccessors(ctx, indexWorkers); err != nil {
 		return err
 	}
 
@@ -1457,9 +1540,6 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 		if err != nil {
 			return err
 		}
-
-		ac := agg.BeginFilesRo()
-		defer ac.Close()
 		return nil
 	}); err != nil {
 		return err
@@ -1470,31 +1550,10 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 		return err
 	}
 
-	if err := db.UpdateNosync(ctx, func(tx kv.RwTx) error {
-		ac := agg.BeginFilesRo()
-		defer ac.Close()
-
-		logEvery := time.NewTicker(30 * time.Second)
-		defer logEvery.Stop()
-
-		stat, err := ac.Prune(ctx, tx, math.MaxUint64, logEvery)
-		if err != nil {
-			return err
-		}
-		logger.Info("aftermath prune finished", "stat", stat.String())
-		return err
-	}); err != nil {
-		return err
-	}
-
 	for hasMoreToPrune := true; hasMoreToPrune; {
 		if err := db.Update(ctx, func(tx kv.RwTx) error {
-			ac := tx.(libstate.HasAggTx).AggTx().(*libstate.AggregatorRoTx)
-			hasMoreToPrune, err = ac.PruneSmallBatches(ctx, 2*time.Minute, tx)
-			if err != nil {
-				return err
-			}
-			return nil
+			hasMoreToPrune, err = tx.(kv.TemporalRwTx).Debug().PruneSmallBatches(ctx, 2*time.Minute)
+			return err
 		}); err != nil {
 			return err
 		}
@@ -1503,7 +1562,7 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	if err = agg.MergeLoop(ctx); err != nil {
 		return err
 	}
-	if err = agg.BuildMissedIndices(ctx, indexWorkers); err != nil {
+	if err = agg.RemoveOverlapsAfterMerge(ctx); err != nil {
 		return err
 	}
 

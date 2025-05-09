@@ -36,33 +36,31 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv/prune"
-	state2 "github.com/erigontech/erigon-lib/state"
-
 	"github.com/anacrolix/torrent"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/erigontech/erigon-lib/log/v3"
-
-	"github.com/erigontech/erigon-lib/diagnostics"
-	"github.com/erigontech/erigon-lib/kv/temporal"
-
+	"github.com/erigontech/erigon-db/rawdb"
 	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/chain/snapcfg"
+	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/datadir"
 	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/dir"
+	"github.com/erigontech/erigon-lib/diagnostics"
 	"github.com/erigontech/erigon-lib/downloader"
 	"github.com/erigontech/erigon-lib/downloader/snaptype"
 	"github.com/erigontech/erigon-lib/etl"
 	protodownloader "github.com/erigontech/erigon-lib/gointerfaces/downloaderproto"
 	"github.com/erigontech/erigon-lib/kv"
+	"github.com/erigontech/erigon-lib/kv/prune"
 	"github.com/erigontech/erigon-lib/kv/rawdbv3"
+	"github.com/erigontech/erigon-lib/kv/temporal"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/state"
-	"github.com/erigontech/erigon/core/rawdb"
+	state2 "github.com/erigontech/erigon-lib/state"
+	"github.com/erigontech/erigon-lib/state/stats"
+	"github.com/erigontech/erigon-lib/types"
 	coresnaptype "github.com/erigontech/erigon/core/snaptype"
-	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/eth/ethconfig"
 	"github.com/erigontech/erigon/eth/ethconfig/estimate"
 	"github.com/erigontech/erigon/eth/stagedsync/stages"
@@ -85,7 +83,7 @@ const (
 )
 
 type SnapshotsCfg struct {
-	db          kv.RwDB
+	db          kv.TemporalRwDB
 	chainConfig chain.Config
 	dirs        datadir.Dirs
 
@@ -103,7 +101,7 @@ type SnapshotsCfg struct {
 	prune            prune.Mode
 }
 
-func StageSnapshotsCfg(db kv.RwDB,
+func StageSnapshotsCfg(db kv.TemporalRwDB,
 	chainConfig chain.Config,
 	syncConfig ethconfig.Sync,
 	dirs datadir.Dirs,
@@ -279,7 +277,7 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 	diagnostics.Send(diagnostics.CurrentSyncSubStage{SubStage: "Download header-chain"})
 	agg := cfg.db.(*temporal.DB).Agg().(*state2.Aggregator)
 	// Download only the snapshots that are for the header chain.
-	if err := snapshotsync.WaitForDownloader(ctx, s.LogPrefix(), cfg.dirs, true /*headerChain=*/, cfg.blobs, cfg.caplinState, cfg.prune, cstate, agg, tx, cfg.blockReader, &cfg.chainConfig, cfg.snapshotDownloader, s.state.StagesIdsList()); err != nil {
+	if err := snapshotsync.WaitForDownloader(ctx, s.LogPrefix(), cfg.dirs, true, cfg.blobs, cfg.caplinState, cfg.prune, cstate, agg, tx, cfg.blockReader, &cfg.chainConfig, cfg.snapshotDownloader, cfg.syncConfig); err != nil {
 		return err
 	}
 
@@ -288,9 +286,10 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 	}
 
 	diagnostics.Send(diagnostics.CurrentSyncSubStage{SubStage: "Download snapshots"})
-	if err := snapshotsync.WaitForDownloader(ctx, s.LogPrefix(), cfg.dirs, false /*headerChain=*/, cfg.blobs, cfg.caplinState, cfg.prune, cstate, agg, tx, cfg.blockReader, &cfg.chainConfig, cfg.snapshotDownloader, s.state.StagesIdsList()); err != nil {
+	if err := snapshotsync.WaitForDownloader(ctx, s.LogPrefix(), cfg.dirs, false, cfg.blobs, cfg.caplinState, cfg.prune, cstate, agg, tx, cfg.blockReader, &cfg.chainConfig, cfg.snapshotDownloader, cfg.syncConfig); err != nil {
 		return err
 	}
+
 	if cfg.notifier.Events != nil {
 		cfg.notifier.Events.OnNewSnapshot()
 	}
@@ -302,7 +301,7 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 
 	indexWorkers := estimate.IndexSnapshot.Workers()
 	diagnostics.Send(diagnostics.CurrentSyncSubStage{SubStage: "E3 Indexing"})
-	if err := agg.BuildMissedIndices(ctx, indexWorkers); err != nil {
+	if err := agg.BuildMissedAccessors(ctx, indexWorkers); err != nil {
 		return err
 	}
 
@@ -336,7 +335,7 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 	}
 
 	diagnostics.Send(diagnostics.CurrentSyncSubStage{SubStage: "Fill DB"})
-	if err := FillDBFromSnapshots(s.LogPrefix(), ctx, tx, cfg.dirs, cfg.blockReader, agg, logger); err != nil {
+	if err := FillDBFromSnapshots(s.LogPrefix(), ctx, tx, cfg.dirs, cfg.blockReader, logger); err != nil {
 		return fmt.Errorf("FillDBFromSnapshots: %w", err)
 	}
 
@@ -347,7 +346,8 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 	{
 		cfg.blockReader.Snapshots().LogStat("download")
 		txNumsReader := rawdbv3.TxNums.WithCustomReadTxNumFunc(freezeblocks.ReadTxNumFuncFromBlockReader(ctx, cfg.blockReader))
-		tx.(state.HasAggTx).AggTx().(*state.AggregatorRoTx).LogStats(tx, func(endTxNumMinimax uint64) (uint64, error) {
+		aggtx := tx.(state.HasAggTx).AggTx().(*state.AggregatorRoTx)
+		stats.LogStats(aggtx, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
 			_, histBlockNumProgress, err := txNumsReader.FindBlockNum(tx, endTxNumMinimax)
 			return histBlockNumProgress, err
 		})
@@ -367,7 +367,7 @@ func getPruneMarkerSafeThreshold(blockReader services.FullBlockReader) uint64 {
 	return snapProgress - pruneMarkerSafeThreshold
 }
 
-func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs datadir.Dirs, blockReader services.FullBlockReader, agg *state.Aggregator, logger log.Logger) error {
+func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs datadir.Dirs, blockReader services.FullBlockReader, logger log.Logger) error {
 	startTime := time.Now()
 	blocksAvailable := blockReader.FrozenBlocks()
 	logEvery := time.NewTicker(logInterval)
@@ -469,7 +469,7 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 				return err
 			}
 
-			_ = tx.ClearBucket(kv.MaxTxNum)
+			_ = tx.ClearTable(kv.MaxTxNum)
 			if err := blockReader.IterateFrozenBodies(func(blockNum, baseTxNum, txAmount uint64) error {
 				select {
 				case <-ctx.Done():
