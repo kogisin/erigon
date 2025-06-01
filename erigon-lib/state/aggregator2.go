@@ -57,6 +57,10 @@ func NewAggregator2(ctx context.Context, dirs datadir.Dirs, aggregationStep uint
 	if err := a.registerII(kv.TracesToIdx, salt, dirs, logger); err != nil {
 		return nil, err
 	}
+
+	a.AddDependency(kv.AccountsDomain, kv.CommitmentDomain)
+	a.AddDependency(kv.StorageDomain, kv.CommitmentDomain)
+
 	a.KeepRecentTxnsOfHistoriesWithDisabledSnapshots(100_000) // ~1k blocks of history
 
 	a.dirtyFilesLock.Lock()
@@ -73,7 +77,6 @@ func init() {
 		Schema.CommitmentDomain.Accessors = AccessorBTree | AccessorExistence
 	}
 	InitSchemas()
-	InitAccountSchemaIntegrity()
 }
 
 type SchemaGen struct {
@@ -95,13 +98,13 @@ type Versioned interface {
 
 func (s *SchemaGen) GetVersioned(name string) (Versioned, error) {
 	switch name {
-	case "accounts", "storage", "code", "commitment", "receipt", "rcache":
+	case kv.AccountsDomain.String(), kv.StorageDomain.String(), kv.CodeDomain.String(), kv.CommitmentDomain.String(), kv.ReceiptDomain.String(), kv.RCacheDomain.String():
 		domain, err := kv.String2Domain(name)
 		if err != nil {
 			return nil, err
 		}
 		return s.GetDomainCfg(domain), nil
-	case "logtopics", "logaddrs", "tracesfrom", "tracesto":
+	case kv.LogTopicIdx.String(), kv.LogAddrIdx.String(), kv.TracesFromIdx.String(), kv.TracesToIdx.String():
 		ii, err := kv.String2InvertedIdx(name)
 		if err != nil {
 			return nil, err
@@ -159,8 +162,7 @@ var Schema = SchemaGen{
 		name: kv.AccountsDomain, valuesTable: kv.TblAccountVals,
 		CompressCfg: DomainCompressCfg, Compression: seg.CompressNone,
 
-		Accessors:            AccessorBTree | AccessorExistence,
-		crossDomainIntegrity: domainIntegrityCheck,
+		Accessors: AccessorBTree | AccessorExistence,
 
 		hist: histCfg{
 			valuesTable:   kv.TblAccountHistoryVals,
@@ -321,8 +323,8 @@ var DomainCompressCfg = seg.Cfg{
 	DictReducerSoftLimit: 2000000,
 	MinPatternLen:        20,
 	MaxPatternLen:        128,
-	SamplingFactor:       4,
-	MaxDictPatterns:      64 * 1024 * 2,
+	SamplingFactor:       1,
+	MaxDictPatterns:      64 * 1024,
 	Workers:              1,
 }
 

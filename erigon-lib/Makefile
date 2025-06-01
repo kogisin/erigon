@@ -60,7 +60,7 @@ protoc-clean:
 	rm -f "$(GOBIN)/protoc"*
 	rm -rf "$(PROTOC_INCLUDE)"
 
-grpc: protoc-all
+grpc: protoc-clean protoc-all
 	go mod vendor
 	PATH="$(GOBIN):$(PATH)" protoc --proto_path=$(PROTO_PATH) --go_out=gointerfaces -I=$(PROTOC_INCLUDE) \
 		--go_opt=Mtypes/types.proto=./typesproto \
@@ -113,4 +113,4 @@ test:
 	$(GOTEST_NOFUZZ) -short -coverprofile=coverage-test.out ./...
 
 test-all:
-	$(GOTEST) -coverprofile=coverage-test-all.out ./...
+	$(GOTEST) -coverprofile=coverage-test-all.out -race ./...

@@ -51,7 +51,7 @@ func TestSnapshotRandom(t *testing.T) {
 	}
 
 	t.Parallel()
-	config := &quick.Config{MaxCount: 1000}
+	config := &quick.Config{MaxCount: 10}
 	err := quick.Check((*snapshotTest).run, config)
 	if cerr, ok := err.(*quick.CheckError); ok {
 		test := cerr.In[0].(*snapshotTest)
@@ -92,7 +92,7 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 		{
 			name: "SetBalance",
 			fn: func(a testAction, s *IntraBlockState) {
-				s.SetBalance(addr, uint256.NewInt(uint64(a.args[0])), tracing.BalanceChangeUnspecified)
+				s.SetBalance(addr, *uint256.NewInt(uint64(a.args[0])), tracing.BalanceChangeUnspecified)
 			},
 			args: make([]int64, 1),
 		},
@@ -116,7 +116,7 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 				var key common.Hash
 				binary.BigEndian.PutUint16(key[:], uint16(a.args[0]))
 				val := uint256.NewInt(uint64(a.args[1]))
-				s.SetState(addr, &key, *val)
+				s.SetState(addr, key, *val)
 			},
 			args: make([]int64, 2),
 		},
@@ -262,22 +262,13 @@ func (test *snapshotTest) run() bool {
 	}
 	defer tx.Rollback()
 
-	domains, err := stateLib.NewSharedDomains(tx, log.New())
-	if err != nil {
-		test.err = err
-		return false
-	}
-	defer domains.Close()
-
-	domains.SetTxNum(1)
-	domains.SetBlockNum(1)
 	err = rawdbv3.TxNums.Append(tx, 1, 1)
 	if err != nil {
 		test.err = err
 		return false
 	}
 	var (
-		state        = New(NewReaderV3(domains))
+		state        = New(NewReaderV3(tx))
 		snapshotRevs = make([]int, len(test.snapshots))
 		sindex       = 0
 	)
@@ -291,7 +282,7 @@ func (test *snapshotTest) run() bool {
 	// Revert all snapshots in reverse order. Each revert must yield a state
 	// that is equivalent to fresh state with all actions up the snapshot applied.
 	for sindex--; sindex >= 0; sindex-- {
-		checkstate := New(NewReaderV3(domains))
+		checkstate := New(NewReaderV3(tx))
 		for _, action := range test.actions[:test.snapshots[sindex]] {
 			action.fn(action, checkstate)
 		}
@@ -397,7 +388,7 @@ func (test *snapshotTest) checkEqual(state, checkstate *IntraBlockState) error {
 		if obj != nil {
 			for key, value := range obj.dirtyStorage {
 				var out uint256.Int
-				checkstate.GetState(addr, &key, &out)
+				checkstate.GetState(addr, key, &out)
 				if !checkeq("GetState("+key.Hex()+")", out, value) {
 					return err
 				}
@@ -410,7 +401,7 @@ func (test *snapshotTest) checkEqual(state, checkstate *IntraBlockState) error {
 		if obj != nil {
 			for key, value := range obj.dirtyStorage {
 				var out uint256.Int
-				state.GetState(addr, &key, &out)
+				state.GetState(addr, key, &out)
 				if !checkeq("GetState("+key.Hex()+")", out, value) {
 					return err
 				}

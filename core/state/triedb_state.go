@@ -657,24 +657,24 @@ func (tds *TrieDbState) ReadAccountData(address common.Address) (*accounts.Accou
 	return account, nil
 }
 
-func (tds *TrieDbState) ReadAccountStorage(address common.Address, key *common.Hash) ([]byte, error) {
+func (tds *TrieDbState) ReadAccountStorage(address common.Address, key common.Hash) (uint256.Int, bool, error) {
 	addrHash := common.Hash(crypto.Keccak256(address.Bytes()))
 	if tds.currentBuffer != nil {
 		if _, ok := tds.currentBuffer.deleted[addrHash]; ok {
-			return nil, nil
+			return uint256.Int{}, false, nil
 		}
 	}
 	if tds.aggregateBuffer != nil {
 		if _, ok := tds.aggregateBuffer.deleted[addrHash]; ok {
-			return nil, nil
+			return uint256.Int{}, false, nil
 		}
 	}
 	seckey, err := common.HashData(key.Bytes())
 	if err != nil {
-		return nil, err
+		return uint256.Int{}, false, err
 	}
 
-	storagePlainKey := dbutils.GenerateStoragePlainKey(address, *key)
+	storagePlainKey := dbutils.GenerateStoragePlainKey(address, key)
 
 	if tds.resolveReads {
 		var storageKey common.StorageKey
@@ -686,14 +686,16 @@ func (tds *TrieDbState) ReadAccountStorage(address common.Address, key *common.H
 	defer tds.tMu.Unlock()
 	enc, ok := tds.t.Get(dbutils.GenerateCompositeTrieKey(addrHash, seckey))
 	if !ok {
-		enc, err := tds.StateReader.ReadAccountStorage(address, key)
+		enc, ok, err := tds.StateReader.ReadAccountStorage(address, key)
 		if err != nil {
-			return nil, err
+			return uint256.Int{}, false, err
 		}
-		return enc, nil
+		return enc, ok, nil
 	}
 
-	return enc, nil
+	var res uint256.Int
+	(&res).SetBytes(enc)
+	return res, true, nil
 }
 
 func (tds *TrieDbState) readAccountCodeFromTrie(addrHash []byte) ([]byte, bool) {
@@ -825,7 +827,7 @@ func (tsw *TrieStateWriter) UpdateAccountCode(address common.Address, incarnatio
 	return nil
 }
 
-func (tsw *TrieStateWriter) WriteAccountStorage(address common.Address, incarnation uint64, key *common.Hash, original, value *uint256.Int) error {
+func (tsw *TrieStateWriter) WriteAccountStorage(address common.Address, incarnation uint64, key common.Hash, original, value uint256.Int) error {
 	addrHash := common.Hash(crypto.Keccak256(address.Bytes()))
 
 	v := value.Bytes()
@@ -842,7 +844,7 @@ func (tsw *TrieStateWriter) WriteAccountStorage(address common.Address, incarnat
 	var storageKey common.StorageKey
 	copy(storageKey[:], dbutils.GenerateCompositeStorageKey(addrHash, incarnation, seckey))
 
-	storagePlainKey := dbutils.GenerateStoragePlainKey(address, *key)
+	storagePlainKey := dbutils.GenerateStoragePlainKey(address, key)
 	tsw.tds.currentBuffer.storageReads[storageKey] = storagePlainKey
 	if len(v) > 0 {
 		m[seckey] = v

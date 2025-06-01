@@ -8,6 +8,10 @@ on:
     - cron: '0 0 * * *'  # Run every night at 00:00 AM UTC
   workflow_dispatch:     # Run manually
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   minimal-node-sync-from-scratch-test:
     runs-on: [self-hosted, qa, long-running]
@@ -19,6 +23,7 @@ jobs:
     env:
       ERIGON_DATA_DIR: ${{ github.workspace }}/erigon_data
       ERIGON_QA_PATH: /home/qarunner/erigon-qa
+      ERIGON_ASSERT: true
       TRACKING_TIME_SECONDS: 7200 # 2 hours
       TOTAL_TIME_SECONDS: 64800 # 18 hours
       CHAIN: ${{ matrix.chain }}
