@@ -38,10 +38,9 @@ import (
 	"github.com/golang-jwt/jwt/v4"
 
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/jsonstream"
-	"github.com/erigontech/erigon-lib/log/v3"
-
 	"github.com/erigontech/erigon-lib/common/dbg"
+	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/rpc/jsonstream"
 )
 
 const (
@@ -281,9 +280,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer codec.Close()
 	var stream jsonstream.Stream
 	if !s.disableStreaming {
-		stream = newJsonStream(w)
+		stream = jsonstream.New(w)
 	}
-	s.serveSingleRequest(ctx, codec, stream)
+
+	errorMsg := s.serveSingleRequest(ctx, codec, stream)
+	if errorMsg != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		codec.WriteJSON(ctx, errorMsg)
+	}
 }
 
 // validateRequest returns a non-zero response code and error message if the

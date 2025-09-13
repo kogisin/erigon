@@ -27,11 +27,11 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/empty"
 	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/order"
-	"github.com/erigontech/erigon-lib/kv/rawdbv3"
-	"github.com/erigontech/erigon-lib/trie"
-	"github.com/erigontech/erigon-lib/types/accounts"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/order"
+	"github.com/erigontech/erigon/db/kv/rawdbv3"
+	"github.com/erigontech/erigon/execution/trie"
+	"github.com/erigontech/erigon/execution/types/accounts"
 )
 
 type Dumper struct {
@@ -135,7 +135,7 @@ func NewDumper(db kv.TemporalTx, txNumsReader rawdbv3.TxNumsReader, blockNumber 
 	}
 }
 
-var TooMuchIterations = errors.New("[rpc] dumper: too much iterations protection triggered")
+var ErrTooManyIterations = errors.New("[rpc] dumper: too many iterations protection triggered")
 
 func (d *Dumper) DumpToCollector(c DumpCollector, excludeCode, excludeStorage bool, startAddress common.Address, maxResults int) ([]byte, error) {
 	var emptyHash = common.Hash{}

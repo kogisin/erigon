@@ -20,11 +20,13 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/state"
-	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/holiman/uint256"
+
+	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/order"
+	"github.com/erigontech/erigon/db/state"
+	"github.com/erigontech/erigon/execution/types/accounts"
 )
 
 var PrunedError = errors.New("old data not available due to pruning")
@@ -56,17 +58,12 @@ func (hr *HistoryReaderV3) SetTrace(trace bool)    { hr.trace = trace }
 // For non-archive node old history files get deleted, so this number will vary
 // but the goal is to know where the historical data begins.
 func (hr *HistoryReaderV3) StateHistoryStartFrom() uint64 {
-	var earliestTxNum uint64 = 0
-	// get the first txnum where  accounts, storage , and code are all available in history files
-	// This is max(HistoryStart(Accounts), HistoryStart(Storage), HistoryStart(Code))
-	stateDomainNames := []kv.Domain{kv.AccountsDomain, kv.StorageDomain, kv.CodeDomain}
-	for _, domainName := range stateDomainNames {
-		domainStartingTxNum := hr.ttx.HistoryStartFrom(domainName)
-		if domainStartingTxNum > earliestTxNum {
-			earliestTxNum = domainStartingTxNum
-		}
-	}
-	return earliestTxNum
+	dbg := hr.ttx.Debug()
+	return min(
+		dbg.HistoryStartFrom(kv.AccountsDomain),
+		dbg.HistoryStartFrom(kv.StorageDomain),
+		dbg.HistoryStartFrom(kv.CodeDomain),
+	)
 }
 
 func (hr *HistoryReaderV3) ReadSet() map[string]*state.KvList { return nil }
@@ -108,6 +105,36 @@ func (hr *HistoryReaderV3) ReadAccountStorage(address common.Address, key common
 		(&res).SetBytes(enc)
 	}
 	return res, ok, err
+}
+
+func (hr *HistoryReaderV3) HasStorage(address common.Address) (bool, error) {
+	to, ok := kv.NextSubtree(address.Bytes())
+	if !ok {
+		to = nil
+	}
+
+	it, err := hr.ttx.RangeAsOf(kv.StorageDomain, address.Bytes(), to, hr.txNum, order.Asc, kv.Unlim)
+	if err != nil {
+		return false, err
+	}
+
+	defer it.Close()
+	// Note: if a storage for an address gets deleted, the historical RangeAsOf will return its slots as empty values.
+	// If the address doesn't have any storage slots, then we return "no storage" immediately
+	// If the address has storage slots, but they are all empty, then we return "no storage"
+	// If we see a non-empty slot for then address, then we return "has storage" immediately
+	for it.HasNext() {
+		_, v, err := it.Next()
+		if err != nil {
+			return false, err
+		}
+
+		if len(v) != 0 {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 func (hr *HistoryReaderV3) ReadAccountCode(address common.Address) ([]byte, error) {

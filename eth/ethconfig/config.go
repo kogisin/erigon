@@ -31,27 +31,34 @@ import (
 
 	"github.com/c2h5oh/datasize"
 
-	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/datadir"
-	"github.com/erigontech/erigon-lib/downloader/downloadercfg"
-	"github.com/erigontech/erigon-lib/kv/prune"
-	"github.com/erigontech/erigon-lib/types"
+	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon/cl/clparams"
-	"github.com/erigontech/erigon/eth/ethconfig/estimate"
+	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/downloader/downloadercfg"
+	"github.com/erigontech/erigon/db/kv/prune"
 	"github.com/erigontech/erigon/eth/gasprice/gaspricecfg"
+	"github.com/erigontech/erigon/execution/builder/buildercfg"
+	"github.com/erigontech/erigon/execution/chain"
+	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 	"github.com/erigontech/erigon/execution/consensus/ethash/ethashcfg"
-	"github.com/erigontech/erigon/params"
-	"github.com/erigontech/erigon/rpc"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/txnprovider/shutter/shuttercfg"
 	"github.com/erigontech/erigon/txnprovider/txpool/txpoolcfg"
 )
 
 // BorDefaultMinerGasPrice defines the minimum gas price for bor validators to mine a transaction.
 var BorDefaultMinerGasPrice = big.NewInt(25 * common.GWei)
-var BorDefaultMinerGasLimit uint64 = 45_000_000
 
-var DefaultMinerGasLimit uint64 = 36_000_000
+// Fail-back block gas limit. Better specify one in the chain config.
+const DefaultBlockGasLimit uint64 = 45_000_000
+
+func DefaultBlockGasLimitByChain(config *Config) uint64 {
+	if config.Genesis == nil || config.Genesis.Config == nil || config.Genesis.Config.DefaultBlockGasLimit == nil {
+		return DefaultBlockGasLimit
+	}
+	return *config.Genesis.Config.DefaultBlockGasLimit
+}
 
 // FullNodeGPO contains default gasprice oracle settings for full node.
 var FullNodeGPO = gaspricecfg.Config{
@@ -77,12 +84,13 @@ var LightClientGPO = gaspricecfg.Config{
 // Defaults contains default settings for use on the Ethereum main net.
 var Defaults = Config{
 	Sync: Sync{
-		ExecWorkerCount:            estimate.BlocksExecution.WorkersHalf(), //only half of CPU, other half will spend for snapshots build/merge/prune
+		ExecWorkerCount:            dbg.Exec3Workers, //only half of CPU, other half will spend for snapshots build/merge/prune
 		BodyCacheLimit:             256 * 1024 * 1024,
 		BodyDownloadTimeoutSeconds: 2,
 		//LoopBlockLimit:             100_000,
-		ParallelStateFlushing: true,
-		ChaosMonkey:           false,
+		ParallelStateFlushing:    true,
+		ChaosMonkey:              false,
+		AlwaysGenerateChangesets: !dbg.BatchCommitments,
 	},
 	Ethash: ethashcfg.Config{
 		CachesInMem:      2,
@@ -93,7 +101,7 @@ var Defaults = Config{
 	},
 	NetworkID: 1,
 	Prune:     prune.DefaultMode,
-	Miner: params.MiningConfig{
+	Miner: buildercfg.MiningConfig{
 		GasPrice: big.NewInt(common.GWei),
 		Recommit: 3 * time.Second,
 	},
@@ -109,6 +117,8 @@ var Defaults = Config{
 		ProduceE3:  true,
 	},
 }
+
+const DefaultChainDBPageSize = 16 * datasize.KB
 
 func init() {
 	home := os.Getenv("HOME")
@@ -141,7 +151,6 @@ type BlocksFreezing struct {
 	ProduceE2         bool // produce new block files
 	ProduceE3         bool // produce new state files
 	NoDownloader      bool // possible to use snapshots without calling Downloader
-	Verify            bool // verify snapshots on startup
 	DisableDownloadE3 bool // disable download state snapshots
 	DownloaderAddr    string
 	ChainName         string
@@ -204,12 +213,12 @@ type Config struct {
 	Whitelist map[uint64]common.Hash `toml:"-"`
 
 	// Mining options
-	Miner params.MiningConfig
+	Miner buildercfg.MiningConfig
 
 	// Ethash options
 	Ethash ethashcfg.Config
 
-	Clique params.ConsensusSnapshotConfig
+	Clique chainspec.ConsensusSnapshotConfig
 	Aura   chain.AuRaConfig
 
 	// Transaction pool options
@@ -232,12 +241,6 @@ type Config struct {
 	HeimdallURL string
 	// No heimdall service
 	WithoutHeimdall bool
-	// Heimdall services active
-	WithHeimdallMilestones bool
-	// Heimdall waypoint recording active
-	WithHeimdallWaypointRecording bool
-	// Use polygon checkpoint sync in preference to POW downloader
-	PolygonSync bool
 
 	// Ethstats service
 	Ethstats string
@@ -245,6 +248,9 @@ type Config struct {
 	InternalCL bool
 
 	OverrideOsakaTime *big.Int `toml:",omitempty"`
+
+	// Whether to avoid overriding chain config already stored in the DB
+	KeepStoredChainConfig bool
 
 	// Embedded Silkworm support
 	SilkwormExecution            bool
@@ -266,6 +272,8 @@ type Config struct {
 
 	// Account Abstraction
 	AllowAA bool
+
+	ElBlockDownloaderV2 bool
 }
 
 type Sync struct {
@@ -280,12 +288,9 @@ type Sync struct {
 	LoopBlockLimit             uint
 	ParallelStateFlushing      bool
 
-	UploadLocation   string
-	UploadFrom       rpc.BlockNumber
-	FrozenBlockLimit uint64
-
 	ChaosMonkey              bool
 	AlwaysGenerateChangesets bool
 	KeepExecutionProofs      bool
 	PersistReceiptsCacheV2   bool
+	SnapshotDownloadToBlock  uint64 // exclusive [0,toBlock)
 }

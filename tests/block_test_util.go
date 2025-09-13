@@ -33,21 +33,21 @@ import (
 
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-db/rawdb"
-	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/common/math"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/rlp"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/eth/ethconsensusconfig"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/rlp"
+	"github.com/erigontech/erigon/execution/stages/mock"
 	"github.com/erigontech/erigon/execution/testutil"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/turbo/services"
-	"github.com/erigontech/erigon/turbo/stages/mock"
 )
 
 // A BlockTest checks handling of entire blocks.
@@ -117,15 +117,13 @@ type btHeaderMarshaling struct {
 	ExcessBlobGas *math.HexOrDecimal64
 }
 
-func (bt *BlockTest) Run(t *testing.T, checkStateRoot bool) error {
+func (bt *BlockTest) Run(t *testing.T) error {
 	config, ok := testutil.Forks[bt.json.Network]
 	if !ok {
 		return testutil.UnsupportedForkError{Name: bt.json.Network}
 	}
-
 	engine := ethconsensusconfig.CreateConsensusEngineBareBones(context.Background(), config, log.New())
-	m := mock.MockWithGenesisEngine(t, bt.genesis(config), engine, false, checkStateRoot)
-	defer m.Close()
+	m := mock.MockWithGenesisEngine(t, bt.genesis(config), engine, false)
 
 	bt.br = m.BlockReader
 	// import pre accounts & construct test genesis block & state root
@@ -141,7 +139,7 @@ func (bt *BlockTest) Run(t *testing.T, checkStateRoot bool) error {
 		return err
 	}
 
-	tx, err := m.DB.BeginRo(m.Ctx)
+	tx, err := m.DB.BeginTemporalRo(m.Ctx)
 	if err != nil {
 		return err
 	}
@@ -228,6 +226,7 @@ func (bt *BlockTest) insertBlocks(m *mock.MockSentry) ([]btBlock, error) {
 			if canonical == cb.Hash() {
 				return nil, fmt.Errorf("block (index %d) insertion should have failed due to: %v", bi, b.ExpectException)
 			}
+			roTx.Rollback()
 		}
 		if b.BlockHeader == nil {
 			continue

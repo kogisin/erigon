@@ -31,11 +31,10 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/event"
 	"github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
-	"github.com/erigontech/erigon-lib/gointerfaces/typesproto"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/testlog"
-	"github.com/erigontech/erigon-lib/types"
-	"github.com/erigontech/erigon-p2p/protocols/eth"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/p2p/protocols/eth"
 )
 
 func TestPeerTracker(t *testing.T) {
@@ -49,6 +48,12 @@ func TestPeerTracker(t *testing.T) {
 	peerTracker.PeerConnected(PeerIdFromUint64(1))
 	peerTracker.PeerConnected(PeerIdFromUint64(2))
 	peerIds = peerTracker.ListPeersMayHaveBlockNum(100)
+	require.Len(t, peerIds, 2)
+	sortPeerIdsAssumingUints(peerIds)
+	require.Equal(t, PeerIdFromUint64(1), peerIds[0])
+	require.Equal(t, PeerIdFromUint64(2), peerIds[1])
+
+	peerIds = peerTracker.ListPeers()
 	require.Len(t, peerIds, 2)
 	sortPeerIdsAssumingUints(peerIds)
 	require.Equal(t, PeerIdFromUint64(1), peerIds[0])
@@ -69,6 +74,11 @@ func TestPeerTracker(t *testing.T) {
 	peerTracker.PeerDisconnected(PeerIdFromUint64(2))
 	peerIds = peerTracker.ListPeersMayHaveBlockNum(100)
 	require.Len(t, peerIds, 1)
+	require.Equal(t, PeerIdFromUint64(1), peerIds[0])
+
+	peerIds = peerTracker.ListPeers()
+	require.Len(t, peerIds, 1)
+	sortPeerIdsAssumingUints(peerIds)
 	require.Equal(t, PeerIdFromUint64(1), peerIds[0])
 
 	peerTracker.PeerConnected(PeerIdFromUint64(2))
@@ -98,14 +108,7 @@ func TestPeerTrackerPeerEventObserver(t *testing.T) {
 	newBlockHashesStream := make(chan *DecodedInboundMessage[*eth.NewBlockHashesPacket])
 	newBlocksStream := make(chan *DecodedInboundMessage[*eth.NewBlockPacket])
 	test := newPeerTrackerTest(t)
-	test.mockPeerProvider(&sentryproto.PeersReply{
-		Peers: []*typesproto.PeerInfo{
-			{
-				Enode: alreadyConnectedPeerEnode,
-			},
-		},
-	})
-	test.mockPeerEvents(peerEventsStream)
+	test.mockPeerEvents(peerEventsStream, alreadyConnectedPeerId)
 	test.mockNewBlockHashesEvents(newBlockHashesStream)
 	test.mockNewBlockEvents(newBlocksStream)
 	peerTracker := test.peerTracker
@@ -155,7 +158,6 @@ func TestPeerTrackerNewBlockHashesObserver(t *testing.T) {
 	newBlockHashesStream := make(chan *DecodedInboundMessage[*eth.NewBlockHashesPacket])
 	newBlocksStream := make(chan *DecodedInboundMessage[*eth.NewBlockPacket])
 	test := newPeerTrackerTest(t)
-	test.mockPeerProvider(&sentryproto.PeersReply{})
 	test.mockPeerEvents(peerEventsStream)
 	test.mockNewBlockHashesEvents(newBlockHashesStream)
 	test.mockNewBlockEvents(newBlocksStream)
@@ -207,7 +209,6 @@ func TestPeerTrackerNewBlocksObserver(t *testing.T) {
 	newBlockHashesStream := make(chan *DecodedInboundMessage[*eth.NewBlockHashesPacket])
 	newBlocksStream := make(chan *DecodedInboundMessage[*eth.NewBlockPacket])
 	test := newPeerTrackerTest(t)
-	test.mockPeerProvider(&sentryproto.PeersReply{})
 	test.mockPeerEvents(peerEventsStream)
 	test.mockNewBlockHashesEvents(newBlockHashesStream)
 	test.mockNewBlockEvents(newBlocksStream)
@@ -254,15 +255,13 @@ func newPeerTrackerTest(t *testing.T) *peerTrackerTest {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := testlog.Logger(t, log.LvlCrit)
 	ctrl := gomock.NewController(t)
-	peerProvider := NewMockpeerProvider(ctrl)
 	peerEventRegistrar := NewMockpeerEventRegistrar(ctrl)
-	peerTracker := NewPeerTracker(logger, peerProvider, peerEventRegistrar, WithPreservingPeerShuffle)
+	peerTracker := NewPeerTracker(logger, peerEventRegistrar, WithPreservingPeerShuffle)
 	return &peerTrackerTest{
 		ctx:                ctx,
 		ctxCancel:          cancel,
 		t:                  t,
 		peerTracker:        peerTracker,
-		peerProvider:       peerProvider,
 		peerEventRegistrar: peerEventRegistrar,
 	}
 }
@@ -272,22 +271,27 @@ type peerTrackerTest struct {
 	ctxCancel          context.CancelFunc
 	t                  *testing.T
 	peerTracker        *PeerTracker
-	peerProvider       *MockpeerProvider
 	peerEventRegistrar *MockpeerEventRegistrar
 }
 
-func (ptt *peerTrackerTest) mockPeerProvider(peerReply *sentryproto.PeersReply) {
-	ptt.peerProvider.EXPECT().
-		Peers(gomock.Any(), gomock.Any()).
-		Return(peerReply, nil).
-		Times(1)
-}
-
-func (ptt *peerTrackerTest) mockPeerEvents(events <-chan *sentryproto.PeerEvent) {
+func (ptt *peerTrackerTest) mockPeerEvents(events <-chan *sentryproto.PeerEvent, alreadyConnected ...*PeerId) {
 	ptt.peerEventRegistrar.EXPECT().
-		RegisterPeerEventObserver(gomock.Any()).
-		DoAndReturn(func(observer event.Observer[*sentryproto.PeerEvent]) UnregisterFunc {
-			ctx, cancel := context.WithCancel(context.Background())
+		RegisterPeerEventObserver(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(observer event.Observer[*sentryproto.PeerEvent], opts ...RegisterOpt) UnregisterFunc {
+			options := applyRegisterOptions(opts)
+			var ctx context.Context
+			if options.replayConnected {
+				ctx = options.replayConnectedCtx
+				for _, peerId := range alreadyConnected {
+					observer(&sentryproto.PeerEvent{
+						PeerId:  peerId.H512(),
+						EventId: sentryproto.PeerEvent_Connect,
+					})
+				}
+			} else {
+				ctx = ptt.ctx
+			}
+			ctx, cancel := context.WithCancel(ctx)
 			go func() {
 				for {
 					select {

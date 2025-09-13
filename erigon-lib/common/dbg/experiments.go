@@ -26,18 +26,20 @@ import (
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/estimate"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/mmap"
 )
 
 var (
 	MaxReorgDepth = EnvInt("MAX_REORG_DEPTH", 512)
 
-	doMemstat           = EnvBool("NO_MEMSTAT", true)
-	saveHeapProfile     = EnvBool("SAVE_HEAP_PROFILE", false)
-	heapProfileFilePath = EnvString("HEAP_PROFILE_FILE_PATH", "")
-	mdbxLockInRam       = EnvBool("MDBX_LOCK_IN_RAM", false)
-	StagesOnlyBlocks    = EnvBool("STAGES_ONLY_BLOCKS", false)
+	noMemstat            = EnvBool("NO_MEMSTAT", false)
+	saveHeapProfile      = EnvBool("SAVE_HEAP_PROFILE", false)
+	heapProfileFilePath  = EnvString("HEAP_PROFILE_FILE_PATH", "")
+	heapProfileThreshold = EnvUint("HEAP_PROFILE_THRESHOLD", 35)
+	heapProfileFrequency = EnvDuration("HEAP_PROFILE_FREQUENCY", 30*time.Second)
+	mdbxLockInRam        = EnvBool("MDBX_LOCK_IN_RAM", false)
+	StagesOnlyBlocks     = EnvBool("STAGES_ONLY_BLOCKS", false)
 
 	stopBeforeStage = EnvString("STOP_BEFORE_STAGE", "")
 	stopAfterStage  = EnvString("STOP_AFTER_STAGE", "")
@@ -81,12 +83,14 @@ var (
 	BatchCommitments     = EnvBool("BATCH_COMMITMENTS", true)
 	CaplinEfficientReorg = EnvBool("CAPLIN_EFFICIENT_REORG", true)
 	UseTxDependencies    = EnvBool("USE_TX_DEPENDENCIES", false)
+	TraceDeletion        = EnvBool("TRACE_DELETION", false)
 )
 
 func ReadMemStats(m *runtime.MemStats) {
-	if doMemstat {
-		runtime.ReadMemStats(m)
+	if noMemstat {
+		return
 	}
+	runtime.ReadMemStats(m)
 }
 
 func MdbxLockInRam() bool { return mdbxLockInRam }
@@ -199,7 +203,7 @@ func SaveHeapProfileNearOOM(opts ...SaveHeapOption) {
 		ReadMemStats(&memStats)
 	}
 
-	totalMemory := mmap.TotalMemory()
+	totalMemory := estimate.TotalMemory()
 	if logger != nil {
 		logger.Info(
 			"[Experiment] heap profile threshold check",
@@ -207,7 +211,7 @@ func SaveHeapProfileNearOOM(opts ...SaveHeapOption) {
 			"total", common.ByteCount(totalMemory),
 		)
 	}
-	if memStats.Alloc < (totalMemory/100)*45 {
+	if memStats.Alloc < (totalMemory/100)*heapProfileThreshold {
 		return
 	}
 
@@ -246,7 +250,7 @@ func SaveHeapProfileNearOOMPeriodically(ctx context.Context, opts ...SaveHeapOpt
 		return
 	}
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(heapProfileFrequency)
 	defer ticker.Stop()
 
 	for {

@@ -30,13 +30,14 @@ import (
 
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/math"
 	"github.com/erigontech/erigon-lib/common/u256"
 	"github.com/erigontech/erigon-lib/crypto"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/types"
 )
 
 const opTestArg = "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
@@ -701,7 +702,7 @@ func TestCreate2Addreses(t *testing.T) {
 		salt := common.BytesToHash(common.FromHex(tt.salt))
 		code := common.FromHex(tt.code)
 		codeHash := crypto.Keccak256(code)
-		address := crypto.CreateAddress2(origin, salt, codeHash)
+		address := types.CreateAddress2(origin, salt, codeHash)
 		/*
 			stack          := newstack()
 			// salt, but we don't need that for this test
@@ -854,5 +855,49 @@ func TestOpMCopy(t *testing.T) {
 		if haveGas != wantGas {
 			t.Errorf("case %d: gas wrong, want %d have %d\n", i, wantGas, haveGas)
 		}
+	}
+}
+
+func TestOpCLZ(t *testing.T) {
+	tests := []struct {
+		name     string
+		inputHex string // hexadecimal input for clarity
+		want     uint64 // expected CLZ result
+	}{
+		{"zero", "0x0", 256},
+		{"one", "0x1", 255},
+		{"all-ones (256 bits)", "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 0},
+		{"low-10-bytes ones", "0xffffffffff", 216}, // 10 bytes = 80 bits, so 256-80=176? Actually input is 0xffffffffff = 40 bits so 256-40=216
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				env            = NewEVM(evmtypes.BlockContext{}, evmtypes.TxContext{}, nil, chain.TestChainConfig, Config{})
+				stack          = New()
+				evmInterpreter = NewEVMInterpreter(env, env.Config())
+			)
+
+			pc := uint64(0)
+
+			// parse input
+			val := new(uint256.Int)
+			if _, err := fmt.Sscan(tc.inputHex, val); err != nil {
+				// fallback: try hex
+				val.SetFromHex(tc.inputHex)
+			}
+
+			stack.push(val)
+			opCLZ(&pc, evmInterpreter, &ScopeContext{Stack: stack})
+
+			if gotLen := stack.len(); gotLen != 1 {
+				t.Fatalf("stack length = %d; want 1", gotLen)
+			}
+			result := stack.pop()
+
+			if got := result.Uint64(); got != tc.want {
+				t.Fatalf("clz(%q) = %d; want %d", tc.inputHex, got, tc.want)
+			}
+		})
 	}
 }

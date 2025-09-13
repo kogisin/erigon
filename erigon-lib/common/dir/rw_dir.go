@@ -17,15 +17,22 @@
 package dir
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/erigontech/erigon-lib/common/dbg"
+	"github.com/erigontech/erigon-lib/log/v3"
 )
 
 func MustExist(path ...string) {
-	const perm = 0764 // user rwx, group rw, other r
+	// user rwx, group rwx, other rx
+	// x is required to navigate through directories. umask 0o022 is the default and will mask final
+	// permissions to 0o755 for newly created files (and directories).
+	const perm = 0o775
 	for _, p := range path {
 		exist, err := Exist(p)
 		if err != nil {
@@ -84,9 +91,9 @@ func FileNonZero(path string) bool {
 	return fi.Size() > 0
 }
 
-// nolint
-func WriteFileWithFsync(name string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+// Writes an entire file from data. Extra flags can be provided.
+func writeFileWithFsyncAndFlags(name string, data []byte, perm os.FileMode, flags int) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|flags, perm)
 	if err != nil {
 		return err
 	}
@@ -102,31 +109,13 @@ func WriteFileWithFsync(name string, data []byte, perm os.FileMode) error {
 	return err
 }
 
-func Recreate(dir string) {
-	exist, err := Exist(dir)
-	if err != nil {
-		panic(err)
-	}
-	if exist {
-		_ = os.RemoveAll(dir)
-	}
-	MustExist(dir)
+// nolint
+func WriteFileWithFsync(name string, data []byte, perm os.FileMode) error {
+	return writeFileWithFsyncAndFlags(name, data, perm, 0)
 }
 
-func HasFileOfType(dir, ext string) bool {
-	files, err := ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		if filepath.Ext(f.Name()) == ext {
-			return true
-		}
-	}
-	return false
+func WriteExclusiveFileWithFsync(name string, data []byte, perm os.FileMode) error {
+	return writeFileWithFsyncAndFlags(name, data, perm, os.O_EXCL)
 }
 
 // nolint
@@ -139,7 +128,7 @@ func DeleteFiles(dirs ...string) error {
 		}
 		for _, fPath := range files {
 			fPath := fPath
-			g.Go(func() error { return os.Remove(fPath) })
+			g.Go(func() error { return RemoveFile(fPath) })
 		}
 	}
 	return g.Wait()
@@ -174,4 +163,33 @@ func ListFiles(dir string, extensions ...string) (paths []string, err error) {
 		paths = append(paths, filepath.Join(dir, f.Name()))
 	}
 	return paths, nil
+}
+
+func RemoveFile(path string) error {
+	if dbg.TraceDeletion {
+		log.Debug("[removing] removing file", "path", path, "stack", dbg.Stack())
+	}
+	return os.Remove(path)
+}
+
+func RemoveAll(path string) error {
+	if dbg.TraceDeletion {
+		log.Debug("[removing] removing dir", "path", path, "stack", dbg.Stack())
+	}
+	return os.RemoveAll(path)
+}
+
+// CreateTemp creates a temporary file using `file` as base
+func CreateTemp(file string) (*os.File, error) {
+	return CreateTempWithExtension(file, "tmp")
+}
+
+func CreateTempWithExtension(file string, extension string) (*os.File, error) {
+	directory := filepath.Dir(file)
+	filename := filepath.Base(file)
+	pattern := fmt.Sprintf("%s.*.%s", filename, extension)
+	if !strings.HasSuffix(pattern, ".tmp") {
+		return nil, fmt.Errorf("extension must end with .tmp, erigon cleans these up at restart. pattern: %s", pattern)
+	}
+	return os.CreateTemp(directory, pattern)
 }

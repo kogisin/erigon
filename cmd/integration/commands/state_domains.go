@@ -31,23 +31,28 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/datadir"
+	"github.com/erigontech/erigon-lib/common/dir"
 	"github.com/erigontech/erigon-lib/common/length"
-	downloadertype "github.com/erigontech/erigon-lib/downloader/snaptype"
-	"github.com/erigontech/erigon-lib/etl"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/mdbx"
+	"github.com/erigontech/erigon-lib/estimate"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/seg"
-	statelib "github.com/erigontech/erigon-lib/state"
 	"github.com/erigontech/erigon/cmd/utils"
-	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
+	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/etl"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/dbcfg"
+	"github.com/erigontech/erigon/db/kv/mdbx"
+	"github.com/erigontech/erigon/db/seg"
+	downloadertype "github.com/erigontech/erigon/db/snaptype"
+	dbstate "github.com/erigontech/erigon/db/state"
+	"github.com/erigontech/erigon/db/state/statecfg"
 	"github.com/erigontech/erigon/eth/ethconfig"
-	"github.com/erigontech/erigon/eth/ethconfig/estimate"
+	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 	"github.com/erigontech/erigon/node/nodecfg"
 	erigoncli "github.com/erigontech/erigon/turbo/cli"
 	"github.com/erigontech/erigon/turbo/debug"
+
+	_ "github.com/erigontech/erigon/polygon/chain" // Register Polygon chains
 )
 
 func init() {
@@ -59,16 +64,16 @@ func init() {
 
 	rootCmd.AddCommand(readDomains)
 
-	withDataDir(purifyDomains)
-	purifyDomains.Flags().StringVar(&outDatadir, "out", "out-purified", "")
-	purifyDomains.Flags().BoolVar(&purifyOnlyCommitment, "only-commitment", true, "purify only commitment domain")
-	purifyDomains.Flags().BoolVar(&replaceInDatadir, "replace-in-datadir", false, "replace the purified domains directly in datadir (will remove .kvei and .bt too)")
-	purifyDomains.Flags().BoolVar(&doIndexBuild, "build-idx", false, "build index for purified domains")
-	purifyDomains.Flags().Float64Var(&minSkipRatioL0, "min-skip-ratio-l0", 0.1, "deprecated: minimum ratio of keys to skip in L0")
-	purifyDomains.Flags().Float64Var(&minSkipRatio, "min-skip-ratio", 0.1, "minimum ratio of keys to skip - otherwise keep file unchanged")
-	purifyDomains.Flags().Uint64Var(&fromStepPurification, "from", 0, "step from which domains would be purified")
-	purifyDomains.Flags().Uint64Var(&toStepPurification, "to", 1e18, "step to which domains would be purified")
-	rootCmd.AddCommand(purifyDomains)
+	withDataDir(compactDomains)
+	withDomain(compactDomains)
+	compactDomains.Flags().StringVar(&outDatadir, "out", "out-compacted", "")
+	compactDomains.Flags().BoolVar(&replaceInDatadir, "replace-in-datadir", false, "replace the compacted domains directly in datadir (will remove .kvei and .bt too)")
+	compactDomains.Flags().BoolVar(&doIndexBuild, "build-idx", false, "build index for compacted domains")
+	compactDomains.Flags().Float64Var(&minSkipRatioL0, "min-skip-ratio-l0", 0.1, "deprecated: minimum ratio of keys to skip in L0")
+	compactDomains.Flags().Float64Var(&minSkipRatio, "min-skip-ratio", 0.1, "minimum ratio of keys to skip - otherwise keep file unchanged")
+	compactDomains.Flags().Uint64Var(&fromStepCompaction, "from", 0, "step from which domains would be compacted")
+	compactDomains.Flags().Uint64Var(&toStepCompaction, "to", 1e18, "step to which domains would be compacted")
+	rootCmd.AddCommand(compactDomains)
 }
 
 // if trie variant is not hex, we could not have another rootHash with to verify it
@@ -77,11 +82,10 @@ var (
 	lastStep                     uint64
 	minSkipRatioL0, minSkipRatio float64
 	outDatadir                   string
-	purifyOnlyCommitment         bool
 	replaceInDatadir             bool
 	doIndexBuild                 bool
-	fromStepPurification         uint64
-	toStepPurification           uint64
+	fromStepCompaction           uint64
+	toStepCompaction             uint64
 )
 
 // write command to just seek and query state by addr and domain from state db and files (if any)
@@ -97,7 +101,12 @@ var readDomains = &cobra.Command{
 		cfg := &nodecfg.DefaultConfig
 		utils.SetNodeConfigCobra(cmd, cfg)
 		ethConfig := &ethconfig.Defaults
-		ethConfig.Genesis = core.GenesisBlockByChainName(chain)
+
+		spec, err := chainspec.ChainSpecByName(chain)
+		if err != nil {
+			utils.Fatalf("unknown chain %s", chain)
+		}
+		ethConfig.Genesis = spec.Genesis
 		erigoncli.ApplyFlagsForEthConfigCobra(cmd.Flags(), ethConfig)
 
 		var readFromDomain string
@@ -122,14 +131,14 @@ var readDomains = &cobra.Command{
 		}
 
 		dirs := datadir.New(datadirCli)
-		chainDb, err := openDB(dbCfg(kv.ChainDB, dirs.Chaindata), true, logger)
+		chainDb, err := openDB(dbCfg(dbcfg.ChainDB, dirs.Chaindata), true, logger)
 		if err != nil {
 			logger.Error("Opening DB", "error", err)
 			return
 		}
 		defer chainDb.Close()
 
-		stateDb, err := mdbx.New(kv.ChainDB, log.New()).Path(filepath.Join(dirs.DataDir, "statedb")).WriteMap(true).Open(ctx)
+		stateDb, err := mdbx.New(dbcfg.ChainDB, log.New()).Path(filepath.Join(dirs.DataDir, "statedb")).WriteMap(true).Open(ctx)
 		if err != nil {
 			return
 		}
@@ -144,10 +153,11 @@ var readDomains = &cobra.Command{
 	},
 }
 
-var purifyDomains = &cobra.Command{
-	Use:     "purify_domains",
+var compactDomains = &cobra.Command{
+	Use:     "compact_domains",
+	Aliases: []string{"purify_domains"},
 	Short:   `Regenerate kv files without repeating keys.`,
-	Example: "go run ./cmd/integration purify_domains --datadir=... --verbosity=3",
+	Example: "go run ./cmd/integration compact_domains --datadir=... --verbosity=3",
 	Args:    cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx, _ := common.RootContext()
@@ -161,7 +171,7 @@ var purifyDomains = &cobra.Command{
 			panic("can't build index when replace-in-datadir=false (consider removing --build-idx)")
 		}
 
-		chainDb, err := openDB(dbCfg(kv.ChainDB, dirs.Chaindata), true, logger)
+		chainDb, err := openDB(dbCfg(dbcfg.ChainDB, dirs.Chaindata), true, logger)
 		if err != nil {
 			logger.Error("Opening DB", "error", err)
 			return
@@ -174,50 +184,67 @@ var purifyDomains = &cobra.Command{
 			return
 		}
 		defer tx.Rollback()
-		defer statelib.AggTx(tx).MadvNormal().DisableReadAhead()
+		defer dbstate.AggTx(tx).MadvNormal().DisableReadAhead()
 
 		// Iterate over all the files in  dirs.SnapDomain and print them
 		domainDir := dirs.SnapDomain
 
 		// make a temporary dir
-		tmpDir, err := os.MkdirTemp(dirs.Tmp, "purifyTemp") // make a temporary dir to store the keys
+		tmpDir, err := os.MkdirTemp(dirs.Tmp, "compactTemp") // make a temporary dir to store the keys
 		if err != nil {
 			logger.Error("Error creating temporary directory", "error", err)
 			return
 		}
-		defer os.RemoveAll(tmpDir)
+		defer dir.RemoveAll(tmpDir)
 		// make a temporary DB to store the keys
 
-		purifyDB := mdbx.MustOpen(tmpDir)
-		defer purifyDB.Close()
-		var purificationDomains []kv.Domain
-		if purifyOnlyCommitment {
-			purificationDomains = []kv.Domain{kv.CommitmentDomain}
-		} else {
-			purificationDomains = []kv.Domain{kv.AccountsDomain, kv.StorageDomain /*"code",*/, kv.CommitmentDomain}
+		compactionDB := mdbx.MustOpen(tmpDir)
+		defer compactionDB.Close()
+
+		domainsStr := strings.Split(domain, ",")
+		if len(domainsStr) == 0 {
+			logger.Error("No domains specified")
+			return
+		}
+		supportedDomain := []kv.Domain{kv.CommitmentDomain, kv.AccountsDomain, kv.StorageDomain, kv.CommitmentDomain}
+		var compactionDomains []kv.Domain
+
+		for _, domain := range domainsStr {
+			found := false
+			for _, supportedDomain := range supportedDomain {
+				if strings.ToLower(domain) == strings.ToLower(supportedDomain.String()) {
+					found = true
+					compactionDomains = append(compactionDomains, supportedDomain)
+					break
+				}
+			}
+			if !found {
+				logger.Error("Domain not supported", "domain", domain)
+				return
+			}
 		}
 
-		for _, domain := range purificationDomains {
+		for _, domain := range compactionDomains {
 			filesToProcess := tx.Debug().DomainFiles(domain).Fullpaths()
-			if err := makePurifiableIndexDB(ctx, purifyDB, filesToProcess, dirs, log.New(), domain); err != nil {
-				logger.Error("Error making purifiable index DB", "error", err)
+			if err := makeCompactableIndexDB(ctx, compactionDB, filesToProcess, dirs, log.New(), domain); err != nil {
+				logger.Error("Error making compactable index DB", "error", err)
 				return
 			}
 		}
-		somethingPurified := false
-		for _, domain := range purificationDomains {
+		somethingCompacted := false
+		for _, domain := range compactionDomains {
 			filesToProcess := tx.Debug().DomainFiles(domain).Fullpaths()
-			something, err := makePurifiedDomains(ctx, purifyDB, filesToProcess, dirs, log.New(), domain)
+			something, err := makeCompactDomains(ctx, compactionDB, filesToProcess, dirs, log.New(), domain)
 			if err != nil {
-				logger.Error("Error making purifiable index DB", "error", err)
+				logger.Error("Error making compact domains", "error", err)
 				return
 			}
-			somethingPurified = somethingPurified || something
+			somethingCompacted = somethingCompacted || something
 		}
-		if replaceInDatadir && doIndexBuild && somethingPurified {
-			logger.Info("building index for the purified files...")
+		if replaceInDatadir && doIndexBuild && somethingCompacted {
+			logger.Info("building index for the compacted files...")
 			if err := chainDb.Debug().ReloadFiles(); err != nil {
-				logger.Error("Error re-opening folder after purification", "error", err)
+				logger.Error("Error re-opening folder after compaction", "error", err)
 				return
 			}
 
@@ -232,7 +259,7 @@ var purifyDomains = &cobra.Command{
 	},
 }
 
-func makePurifiableIndexDB(ctx context.Context, db kv.RwDB, files []string, dirs datadir.Dirs, logger log.Logger, domain kv.Domain) error {
+func makeCompactableIndexDB(ctx context.Context, db kv.RwDB, files []string, dirs datadir.Dirs, logger log.Logger, domain kv.Domain) error {
 	var tbl string
 	switch domain {
 	case kv.AccountsDomain:
@@ -250,12 +277,13 @@ func makePurifiableIndexDB(ctx context.Context, db kv.RwDB, files []string, dirs
 	}
 	// Iterate over all the files in  dirs.SnapDomain and print them
 	fileInfos := []downloadertype.FileInfo{}
-	for _, file := range files {
-		res, ok, _ := downloadertype.ParseFileName("", file)
+	for _, f := range files {
+		dirPart, fileName := filepath.Split(f)
+		res, ok, _ := downloadertype.ParseFileName(dirPart, fileName)
 		if !ok {
 			panic("invalid file name")
 		}
-		if res.From < fromStepPurification || res.To > toStepPurification {
+		if res.From < fromStepCompaction || res.To > toStepCompaction {
 			continue
 		}
 		fileInfos = append(fileInfos, res)
@@ -265,7 +293,7 @@ func makePurifiableIndexDB(ctx context.Context, db kv.RwDB, files []string, dirs
 		return fileInfos[i].CompareTo(fileInfos[j]) <= 0
 	})
 
-	collector := etl.NewCollectorWithAllocator("Purification", dirs.Tmp, etl.LargeSortableBuffers, logger)
+	collector := etl.NewCollectorWithAllocator("Compaction", dirs.Tmp, etl.LargeSortableBuffers, logger)
 	defer collector.Close()
 	collector.LogLvl(log.LvlDebug)
 	collector.SortAndFlushInBackground(true)
@@ -303,7 +331,7 @@ func makePurifiableIndexDB(ctx context.Context, db kv.RwDB, files []string, dirs
 			count++
 			//fmt.Println("count: ", count, "keyLength: ", len(buf))
 			if count%10_000_000 == 0 {
-				logger.Info(fmt.Sprintf("[purify] Indexed %dM keys in file %s", count/1_000_000, baseFileName))
+				logger.Info(fmt.Sprintf("[compaction] Indexed %dM keys in file %s", count/1_000_000, baseFileName))
 			}
 			// skip values
 			getter.Skip()
@@ -318,9 +346,9 @@ func makePurifiableIndexDB(ctx context.Context, db kv.RwDB, files []string, dirs
 	return tx.Commit()
 }
 
-func makePurifiedDomains(ctx context.Context, db kv.RwDB, files []string, dirs datadir.Dirs, logger log.Logger, domain kv.Domain) (somethingPurified bool, err error) {
-	compressionType := statelib.Schema.GetDomainCfg(domain).Compression
-	compressCfg := statelib.Schema.GetDomainCfg(domain).CompressCfg
+func makeCompactDomains(ctx context.Context, db kv.RwDB, files []string, dirs datadir.Dirs, logger log.Logger, domain kv.Domain) (somethingCompacted bool, err error) {
+	compressionType := statecfg.Schema.GetDomainCfg(domain).Compression
+	compressCfg := statecfg.Schema.GetDomainCfg(domain).CompressCfg
 	compressCfg.Workers = runtime.NumCPU()
 	var tbl string
 	switch domain {
@@ -341,12 +369,13 @@ func makePurifiedDomains(ctx context.Context, db kv.RwDB, files []string, dirs d
 	}
 	// Iterate over all the files in  dirs.SnapDomain and print them
 	fileInfos := []downloadertype.FileInfo{}
-	for _, file := range files {
-		res, ok, _ := downloadertype.ParseFileName("", file)
+	for _, f := range files {
+		dirPart, fileName := filepath.Split(f)
+		res, ok, _ := downloadertype.ParseFileName(dirPart, fileName)
 		if !ok {
 			panic("invalid file name")
 		}
-		if res.From < fromStepPurification || res.To > toStepPurification {
+		if res.From < fromStepCompaction || res.To > toStepCompaction {
 			continue
 		}
 		fileInfos = append(fileInfos, res)
@@ -377,7 +406,7 @@ func makePurifiedDomains(ctx context.Context, db kv.RwDB, files []string, dirs d
 		defer dec.Close()
 		getter := dec.MakeGetter()
 
-		valuesComp, err := seg.NewCompressor(ctx, "Purification", outputFilePath, dirs.Tmp, compressCfg, log.LvlTrace, log.New())
+		valuesComp, err := seg.NewCompressor(ctx, "Compaction", outputFilePath, dirs.Tmp, compressCfg, log.LvlTrace, log.New())
 		if err != nil {
 			return false, fmt.Errorf("create %s values compressor: %w", outputFilePath, err)
 		}
@@ -417,7 +446,7 @@ func makePurifiedDomains(ctx context.Context, db kv.RwDB, files []string, dirs d
 			count++
 			if count%10_000_000 == 0 {
 				skipRatio := float64(skipped) / float64(count)
-				logger.Info(fmt.Sprintf("Indexed %dM keys, skipped %dk, in file %s. skip ratio: %.2f", count/1_000_000, skipped/1_000, baseFileName, skipRatio))
+				logger.Info(fmt.Sprintf("Indexed %dM keys, skipped %dM, in file %s. skip ratio: %.2f", count/1_000_000, skipped/1_000_000, baseFileName, skipRatio))
 			}
 		}
 
@@ -451,10 +480,10 @@ func makePurifiedDomains(ctx context.Context, db kv.RwDB, files []string, dirs d
 			)
 			logger.Info(fmt.Sprintf("Removed the files %s and %s", kveiFile, btFile))
 		}
-		somethingPurified = true
+		somethingCompacted = true
 	}
 
-	return somethingPurified, nil
+	return somethingCompacted, nil
 }
 
 func requestDomains(chainDb, stateDb kv.RwDB, ctx context.Context, readDomain string, addrs [][]byte, logger log.Logger) error {
@@ -465,7 +494,7 @@ func requestDomains(chainDb, stateDb kv.RwDB, ctx context.Context, readDomain st
 	if !ok {
 		return errors.New("stateDb transaction is not a temporal transaction")
 	}
-	domains, err := statelib.NewSharedDomains(temporalTx, logger)
+	domains, err := dbstate.NewSharedDomains(temporalTx, logger)
 	if err != nil {
 		return err
 	}
@@ -516,6 +545,6 @@ func requestDomains(chainDb, stateDb kv.RwDB, ctx context.Context, readDomain st
 
 func removeManyIgnoreError(filePaths ...string) {
 	for _, filePath := range filePaths {
-		os.Remove(filePath)
+		dir.RemoveFile(filePath)
 	}
 }

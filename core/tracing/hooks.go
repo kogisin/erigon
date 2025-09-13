@@ -24,9 +24,9 @@ import (
 
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/types"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/types"
 )
 
 // OpContext provides the context at which the opcode is being
@@ -44,7 +44,7 @@ type OpContext interface {
 
 // IntraBlockState gives tracers access to the whole state.
 type IntraBlockState interface {
-	GetBalance(common.Address) (*uint256.Int, error)
+	GetBalance(common.Address) (uint256.Int, error)
 	GetNonce(common.Address) (uint64, error)
 	GetCode(common.Address) ([]byte, error)
 	GetState(addr common.Address, key common.Hash, value *uint256.Int) error

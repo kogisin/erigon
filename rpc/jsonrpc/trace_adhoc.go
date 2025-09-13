@@ -30,17 +30,17 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	math2 "github.com/erigontech/erigon-lib/common/math"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types"
-	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/tracing"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
+	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/eth/tracers"
 	"github.com/erigontech/erigon/eth/tracers/config"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	ptracer "github.com/erigontech/erigon/polygon/tracer"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
@@ -61,7 +61,7 @@ const (
 	TraceTypeVmTrace   = "vmTrace"
 )
 
-// TraceCallParam (see SendTxArgs -- this allows optional prams plus don't use MixedcaseAddress
+// TraceCallParam (see SendTxArgs -- this allows optional params plus don't use MixedcaseAddress
 type TraceCallParam struct {
 	From                 *common.Address   `json:"from"`
 	To                   *common.Address   `json:"to"`
@@ -195,7 +195,7 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 			}
 			gasFeeCap, gasTipCap = gasPrice, gasPrice
 		} else {
-			// User specified 1559 gas feilds (or none), use those
+			// User specified 1559 gas fields (or none), use those
 			gasFeeCap = new(uint256.Int)
 			if args.MaxFeePerGas != nil {
 				overflow := gasFeeCap.SetFromBig(args.MaxFeePerGas.ToInt())
@@ -221,7 +221,7 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 			}
 		}
 		if args.MaxFeePerBlobGas != nil {
-			maxFeePerBlobGas.SetFromBig(args.MaxFeePerBlobGas.ToInt())
+			maxFeePerBlobGas = uint256.MustFromBig(args.MaxFeePerBlobGas.ToInt())
 		}
 	}
 	value := new(uint256.Int)
@@ -418,6 +418,7 @@ func (ot *OeTracer) captureStartOrEnter(deep bool, typ vm.OpCode, from common.Ad
 	if create {
 		action := CreateTraceAction{}
 		action.From = from
+		action.CreationMethod = strings.ToLower(typ.String())
 		action.Gas.ToInt().SetUint64(gas)
 		action.Init = common.CopyBytes(input)
 		action.Value.ToInt().Set(value.ToBig())
@@ -888,12 +889,7 @@ func (api *TraceAPIImpl) ReplayTransaction(ctx context.Context, txHash common.Ha
 		}
 
 		// otherwise this may be a bor state sync transaction - check
-		if api.useBridgeReader {
-			blockNum, ok, err = api.bridgeReader.EventTxnLookup(ctx, txHash)
-		} else {
-			blockNum, ok, err = api._blockReader.EventLookup(ctx, tx, txHash)
-		}
-
+		blockNum, ok, err = api.bridgeReader.EventTxnLookup(ctx, txHash)
 		if err != nil {
 			return nil, err
 		}
@@ -1054,21 +1050,20 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		return nil, err
 	}
 
-	stateReader, err := rpchelper.CreateStateReader(ctx, tx, api._blockReader, *blockNrOrHash, 0, api.filters, api.stateCache, chainConfig.ChainName)
+	header, err := api.headerByRPCNumber(ctx, rpc.BlockNumber(blockNumber), tx)
+	if err != nil {
+		return nil, err
+	}
+	if header == nil {
+		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
+	}
+
+	stateReader, err := rpchelper.CreateStateReader(ctx, tx, api._blockReader, *blockNrOrHash, 0, api.filters, api.stateCache, api._txNumReader)
 	if err != nil {
 		return nil, err
 	}
 
 	ibs := state.New(stateReader)
-
-	block, err := api.blockWithSenders(ctx, tx, hash, blockNumber)
-	if err != nil {
-		return nil, err
-	}
-	if block == nil {
-		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
-	}
-	header := block.Header()
 
 	// Setup context so it may be cancelled the call has completed
 	// or, in case of unmetered gas, setup a context with a timeout.
@@ -1113,7 +1108,7 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 
 	// Get a new instance of the EVM.
 	var baseFee *uint256.Int
-	if header != nil && header.BaseFee != nil {
+	if header.BaseFee != nil {
 		var overflow bool
 		baseFee, overflow = uint256.FromBig(header.BaseFee)
 		if overflow {
@@ -1146,7 +1141,7 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 
 	gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
 	var execResult *evmtypes.ExecutionResult
-	ibs.SetTxContext(0)
+	ibs.SetTxContext(blockCtx.BlockNumber, 0)
 	ibs.SetHooks(ot.Tracer().Hooks)
 
 	if ot.Tracer() != nil && ot.Tracer().Hooks.OnTxStart != nil {
@@ -1185,11 +1180,11 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 
 // CallMany implements trace_callMany.
 func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, parentNrOrHash *rpc.BlockNumberOrHash, traceConfig *config.TraceConfig) ([]*TraceCallResult, error) {
-	dbtx, err := api.kv.BeginTemporalRo(ctx)
+	tx, err := api.kv.BeginTemporalRo(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer dbtx.Rollback()
+	defer tx.Rollback()
 
 	var callParams []TraceCallParam
 	dec := json.NewDecoder(bytes.NewReader(calls))
@@ -1236,21 +1231,19 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, pa
 		var num = rpc.LatestBlockNumber
 		parentNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
-	blockNumber, hash, _, err := rpchelper.GetBlockNumber(ctx, *parentNrOrHash, dbtx, api._blockReader, api.filters)
+	blockNumber, hash, _, err := rpchelper.GetBlockNumber(ctx, *parentNrOrHash, tx, api._blockReader, api.filters)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO: can read here only parent header
-	parentBlock, err := api.blockWithSenders(ctx, dbtx, hash, blockNumber)
+	parentHeader, err := api.headerByRPCNumber(ctx, rpc.BlockNumber(blockNumber), tx)
 	if err != nil {
 		return nil, err
 	}
-	if parentBlock == nil {
+	if parentHeader == nil {
 		return nil, fmt.Errorf("parent block %d(%x) not found", blockNumber, hash)
 	}
-	parentHeader := parentBlock.Header()
-	if parentHeader != nil && parentHeader.BaseFee != nil {
+	if parentHeader.BaseFee != nil {
 		var overflow bool
 		baseFee, overflow = uint256.FromBig(parentHeader.BaseFee)
 		if overflow {
@@ -1271,11 +1264,7 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, pa
 		}
 	}
 
-	chainConfig, err := api.chainConfig(ctx, dbtx)
-	if err != nil {
-		return nil, err
-	}
-	stateReader, err := rpchelper.CreateStateReader(ctx, dbtx, api._blockReader, *parentNrOrHash, 0, api.filters, api.stateCache, chainConfig.ChainName)
+	stateReader, err := rpchelper.CreateStateReader(ctx, tx, api._blockReader, *parentNrOrHash, 0, api.filters, api.stateCache, api._txNumReader)
 	if err != nil {
 		return nil, err
 	}
@@ -1286,7 +1275,7 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, pa
 	cachedWriter := state.NewCachedWriter(noop, stateCache)
 	ibs := state.New(cachedReader)
 
-	trace, _, err := api.doCallBlock(ctx, dbtx, stateReader, stateCache, cachedWriter, ibs,
+	trace, _, err := api.doCallBlock(ctx, tx, stateReader, stateCache, cachedWriter, ibs,
 		txns, msgs, callParams, parentNrOrHash, parentHeader, true /* gasBailout */, traceConfig)
 
 	return trace, err
@@ -1430,7 +1419,7 @@ func (api *TraceAPIImpl) doCallBlock(ctx context.Context, dbtx kv.Tx, stateReade
 		if args.isBorStateSyncTxn {
 			txFinalized = true
 			var stateSyncEvents []*types.Message
-			stateSyncEvents, err = api.stateSyncEvents(ctx, dbtx, header.Hash(), parentBlockNumber+1, chainConfig)
+			stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), parentBlockNumber+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1449,7 +1438,7 @@ func (api *TraceAPIImpl) doCallBlock(ctx context.Context, dbtx kv.Tx, stateReade
 				tracer,
 			)
 		} else {
-			ibs.SetTxContext(txIndex)
+			ibs.SetTxContext(blockCtx.BlockNumber, txIndex)
 			if tracer != nil {
 				ibs.SetHooks(tracer.Hooks)
 			}
@@ -1473,7 +1462,7 @@ func (api *TraceAPIImpl) doCallBlock(ctx context.Context, dbtx kv.Tx, stateReade
 			tracer.Hooks.OnTxEnd(&types.Receipt{GasUsed: execResult.GasUsed}, nil)
 		}
 
-		chainRules := chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Time)
+		chainRules := blockCtx.Rules(chainConfig)
 		traceResult.Output = common.CopyBytes(execResult.ReturnData)
 		if traceTypeStateDiff {
 			initialIbs := state.New(cloneReader)
@@ -1643,7 +1632,7 @@ func (api *TraceAPIImpl) doCall(ctx context.Context, dbtx kv.Tx, stateReader sta
 	if args.isBorStateSyncTxn {
 		txFinalized = true
 		var stateSyncEvents []*types.Message
-		stateSyncEvents, err = api.stateSyncEvents(ctx, dbtx, header.Hash(), parentBlockNumber+1, chainConfig)
+		stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), parentBlockNumber+1)
 		if err != nil {
 			return nil, err
 		}
@@ -1662,7 +1651,7 @@ func (api *TraceAPIImpl) doCall(ctx context.Context, dbtx kv.Tx, stateReader sta
 			tracer,
 		)
 	} else {
-		ibs.SetTxContext(txIndex)
+		ibs.SetTxContext(blockCtx.BlockNumber, txIndex)
 		txCtx := core.NewEVMTxContext(msg)
 		evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
 		gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
@@ -1673,7 +1662,7 @@ func (api *TraceAPIImpl) doCall(ctx context.Context, dbtx kv.Tx, stateReader sta
 		return nil, fmt.Errorf("first run for txIndex %d error: %w", txIndex, err)
 	}
 
-	chainRules := chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Time)
+	chainRules := blockCtx.Rules(chainConfig)
 	traceResult.Output = common.CopyBytes(execResult.ReturnData)
 	if traceTypeStateDiff {
 		initialIbs := state.New(cloneReader)

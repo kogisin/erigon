@@ -20,9 +20,9 @@
 package nodecfg
 
 import (
-	"github.com/erigontech/erigon-lib/direct"
-	p2p "github.com/erigontech/erigon-p2p"
-	"github.com/erigontech/erigon-p2p/nat"
+	"github.com/erigontech/erigon/node/direct"
+	"github.com/erigontech/erigon/p2p"
+	"github.com/erigontech/erigon/p2p/nat"
 	"github.com/erigontech/erigon/rpc/rpccfg"
 )
 
