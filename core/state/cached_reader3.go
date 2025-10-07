@@ -19,7 +19,7 @@ package state
 import (
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/kvcache"
 	"github.com/erigontech/erigon/execution/types/accounts"
@@ -36,6 +36,8 @@ type CachedReader3 struct {
 func NewCachedReader3(cache kvcache.CacheView, tx kv.TemporalTx) *CachedReader3 {
 	return &CachedReader3{cache: cache, db: tx}
 }
+
+func (r *CachedReader3) SetTrace(_ bool, _ string) {}
 
 // ReadAccountData is called when an account needs to be fetched from the state
 func (r *CachedReader3) ReadAccountData(address common.Address) (*accounts.Account, error) {

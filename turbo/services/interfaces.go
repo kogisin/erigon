@@ -20,8 +20,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/snapshotsync"
@@ -41,6 +41,7 @@ type BlockReader interface {
 	CurrentBlock(db kv.Tx) (*types.Block, error)
 	BlockWithSenders(ctx context.Context, tx kv.Getter, hash common.Hash, blockNum uint64) (block *types.Block, senders []common.Address, err error)
 	IterateFrozenBodies(f func(blockNum, baseTxNum, txCount uint64) error) error
+	MinimumBlockAvailable(ctx context.Context, tx kv.Tx) (uint64, error)
 }
 
 type HeaderReader interface {

@@ -25,10 +25,9 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/core/state"
-	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/db/kv"
 	dbstate "github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/execution/chain"
@@ -37,6 +36,7 @@ import (
 	"github.com/erigontech/erigon/execution/consensus/merge"
 	"github.com/erigontech/erigon/execution/consensus/misc"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/vm"
 )
 
 // BlockGen creates blocks for testing.
@@ -381,7 +381,7 @@ func GenerateChain(config *chain.Config, parent *types.Block, engine consensus.E
 
 			var err error
 			//b.header.Root, err = CalcHashRootForTests(tx, b.header, histV3, true)
-			stateRoot, err := domains.ComputeCommitment(ctx, true, b.header.Number.Uint64(), uint64(txNum), "")
+			stateRoot, err := domains.ComputeCommitment(ctx, tx, true, b.header.Number.Uint64(), uint64(txNum), "", nil)
 			if err != nil {
 				return nil, nil, fmt.Errorf("call to CalcTrieRoot: %w", err)
 			}

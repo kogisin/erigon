@@ -23,9 +23,9 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/dbg"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/etl"
 	"github.com/erigontech/erigon/db/kv"
@@ -70,7 +70,7 @@ func ResetBlocks(tx kv.RwTx, db kv.RoDB, br services.FullBlockReader, bw *blocki
 		return fmt.Errorf("saving Bodies progress failed: %w", err)
 	}
 	if err := stages.SaveStageProgress(tx, stages.Headers, 1); err != nil {
-		return fmt.Errorf("saving Bodies progress failed: %w", err)
+		return fmt.Errorf("saving Headers progress failed: %w", err)
 	}
 	if err := stages.SaveStageProgress(tx, stages.Snapshots, 0); err != nil {
 		return fmt.Errorf("saving Snapshots progress failed: %w", err)

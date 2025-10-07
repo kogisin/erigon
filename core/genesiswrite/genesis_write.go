@@ -32,9 +32,9 @@ import (
 	"github.com/c2h5oh/datasize"
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/empty"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/empty"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/tracing"
@@ -341,7 +341,7 @@ func GenesisToBlock(tb testing.TB, g *types.Genesis, dirs datadir.Dirs, logger l
 	//r, w := state.NewDbStateReader(tx), state.NewDbStateWriter(tx, 0)
 	r, w := state.NewReaderV3(sd.AsGetter(tx)), state.NewWriter(sd.AsPutDel(tx), nil, txNum)
 
-	statedb := state.New(r)
+	statedb := state.NewWithVersionMap(r, &state.VersionMap{})
 	statedb.SetTrace(false)
 
 	hasConstructorAllocation := false
@@ -387,7 +387,7 @@ func GenesisToBlock(tb testing.TB, g *types.Genesis, dirs datadir.Dirs, logger l
 		return nil, nil, err
 	}
 
-	rh, err := sd.ComputeCommitment(context.Background(), true, blockNum, txNum, "genesis")
+	rh, err := sd.ComputeCommitment(context.Background(), tx, true, blockNum, txNum, "genesis", nil)
 	if err != nil {
 		return nil, nil, err
 	}

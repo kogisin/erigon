@@ -25,9 +25,9 @@ import (
 
 	mapset "github.com/deckarep/golang-set/v2"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/dbg"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/db/kv"
@@ -93,7 +93,7 @@ func (mb *MiningBlock) AvailableRlpSpace(chainConfig *chain.Config, withAddition
 	blockSize += *mb.withdrawalsRlpSize
 	blockSize += mb.TxnsRlpSize(withAdditional...)
 	blockSize += rlp.ListPrefixLen(blockSize)
-	maxSize := chainConfig.GetMaxRlpBlockSize(mb.Header.Number.Uint64())
+	maxSize := chainConfig.GetMaxRlpBlockSize(mb.Header.Time)
 	return maxSize - blockSize
 }
 

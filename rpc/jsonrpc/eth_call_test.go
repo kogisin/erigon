@@ -27,12 +27,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/crypto"
-	"github.com/erigontech/erigon-lib/gointerfaces/txpoolproto"
-	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/rpcdaemontest"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/db/kv"
@@ -44,6 +43,7 @@ import (
 	"github.com/erigontech/erigon/execution/stages/mock"
 	"github.com/erigontech/erigon/execution/trie"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/node/gointerfaces/txpoolproto"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/ethapi"
 	"github.com/erigontech/erigon/rpc/rpccfg"
@@ -62,7 +62,7 @@ func TestEstimateGas(t *testing.T) {
 	if _, err := api.EstimateGas(context.Background(), &ethapi.CallArgs{
 		From: &from,
 		To:   &to,
-	}, nil, nil); err != nil {
+	}, nil, nil, nil); err != nil {
 		t.Errorf("calling EstimateGas: %v", err)
 	}
 }
@@ -79,7 +79,7 @@ func TestEthCallNonCanonical(t *testing.T) {
 	if _, err := api.Call(context.Background(), ethapi.CallArgs{
 		From: &from,
 		To:   &to,
-	}, blockNumberOrHashRef, nil); err != nil {
+	}, blockNumberOrHashRef, nil, nil); err != nil {
 		if fmt.Sprintf("%v", err) != "hash 3fcb7c0d4569fddc89cbea54b42f163e0c789351d98810a513895ab44b47020b is not currently canonical" {
 			t.Errorf("wrong error: %v", err)
 		}
@@ -104,7 +104,7 @@ func TestEthCallToPrunedBlock(t *testing.T) {
 		From: &bankAddress,
 		To:   &contractAddress,
 		Data: &callDataBytes,
-	}, blockNumberOrHashRef, nil); err != nil {
+	}, blockNumberOrHashRef, nil, nil); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }

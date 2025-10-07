@@ -31,9 +31,9 @@ import (
 
 	"github.com/c2h5oh/datasize"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/downloader/downloadercfg"
 	"github.com/erigontech/erigon/db/kv/prune"
@@ -51,7 +51,7 @@ import (
 var BorDefaultMinerGasPrice = big.NewInt(25 * common.GWei)
 
 // Fail-back block gas limit. Better specify one in the chain config.
-const DefaultBlockGasLimit uint64 = 45_000_000
+const DefaultBlockGasLimit uint64 = 60_000_000
 
 func DefaultBlockGasLimitByChain(config *Config) uint64 {
 	if config.Genesis == nil || config.Genesis.Config == nil || config.Genesis.Config.DefaultBlockGasLimit == nil {
@@ -91,6 +91,7 @@ var Defaults = Config{
 		ParallelStateFlushing:    true,
 		ChaosMonkey:              false,
 		AlwaysGenerateChangesets: !dbg.BatchCommitments,
+		MaxReorgDepth:            dbg.MaxReorgDepth,
 	},
 	Ethash: ethashcfg.Config{
 		CachesInMem:      2,
@@ -272,8 +273,6 @@ type Config struct {
 
 	// Account Abstraction
 	AllowAA bool
-
-	ElBlockDownloaderV2 bool
 }
 
 type Sync struct {
@@ -290,6 +289,7 @@ type Sync struct {
 
 	ChaosMonkey              bool
 	AlwaysGenerateChangesets bool
+	MaxReorgDepth            uint64
 	KeepExecutionProofs      bool
 	PersistReceiptsCacheV2   bool
 	SnapshotDownloadToBlock  uint64 // exclusive [0,toBlock)

@@ -28,13 +28,13 @@ import (
 
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/crypto"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/core/tracing"
-	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/eth/tracers"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/vm"
 )
 
 //go:generate gencodec -type account -field-override accountMarshaling -out gen_account_json.go
@@ -46,10 +46,11 @@ func init() {
 type state = map[common.Address]*account
 
 type account struct {
-	Balance *big.Int                    `json:"balance,omitempty"`
-	Code    []byte                      `json:"code,omitempty"`
-	Nonce   uint64                      `json:"nonce,omitempty"`
-	Storage map[common.Hash]common.Hash `json:"storage,omitempty"`
+	Balance  *big.Int                    `json:"balance,omitempty"`
+	Code     []byte                      `json:"code,omitempty"`
+	CodeHash *common.Hash                `json:"codeHash,omitempty"`
+	Nonce    uint64                      `json:"nonce,omitempty"`
+	Storage  map[common.Hash]common.Hash `json:"storage,omitempty"`
 }
 
 func (a *account) exists() bool {
@@ -308,6 +309,12 @@ func (t *prestateTracer) lookupAccount(addr common.Address) {
 
 	if !t.config.DisableCode {
 		t.pre[addr].Code = code
+		if len(code) > 0 {
+			codeHash := crypto.Keccak256Hash(code)
+			t.pre[addr].CodeHash = &codeHash
+		} else {
+			t.pre[addr].CodeHash = nil
+		}
 	}
 	if !t.config.DisableStorage {
 		t.pre[addr].Storage = make(map[common.Hash]common.Hash)

@@ -23,8 +23,8 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/order"
@@ -494,7 +494,7 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 		return nil, fmt.Errorf("getReceipt error: %w", err)
 	}
 
-	return ethutils.MarshalReceipt(receipt, txn, chainConfig, header, txnHash, true, false), nil
+	return ethutils.MarshalReceipt(receipt, txn, chainConfig, header, txnHash, true, true), nil
 }
 
 // GetBlockReceipts - receipts for individual block

@@ -45,28 +45,20 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/dbg"
-	"github.com/erigontech/erigon-lib/common/dir"
-	"github.com/erigontech/erigon-lib/common/disk"
-	"github.com/erigontech/erigon-lib/crypto"
-	"github.com/erigontech/erigon-lib/event"
-	"github.com/erigontech/erigon-lib/gointerfaces/downloaderproto"
-	"github.com/erigontech/erigon-lib/gointerfaces/grpcutil"
-	"github.com/erigontech/erigon-lib/gointerfaces/remoteproto"
-	"github.com/erigontech/erigon-lib/gointerfaces/sentinelproto"
-	"github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
-	"github.com/erigontech/erigon-lib/gointerfaces/txpoolproto"
-	"github.com/erigontech/erigon-lib/gointerfaces/typesproto"
-	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/persistence/format/snapshot_format/getters"
 	executionclient "github.com/erigontech/erigon/cl/phase1/execution_client"
 	"github.com/erigontech/erigon/cmd/caplin/caplin1"
 	rpcdaemoncli "github.com/erigontech/erigon/cmd/rpcdaemon/cli"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/dir"
+	"github.com/erigontech/erigon/common/disk"
+	"github.com/erigontech/erigon/common/event"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/genesiswrite"
-	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/downloader"
 	"github.com/erigontech/erigon/db/downloader/downloadercfg"
@@ -110,8 +102,16 @@ import (
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
 	stages2 "github.com/erigontech/erigon/execution/stages"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/node"
 	"github.com/erigontech/erigon/node/direct"
+	"github.com/erigontech/erigon/node/gointerfaces/downloaderproto"
+	"github.com/erigontech/erigon/node/gointerfaces/grpcutil"
+	"github.com/erigontech/erigon/node/gointerfaces/remoteproto"
+	"github.com/erigontech/erigon/node/gointerfaces/sentinelproto"
+	"github.com/erigontech/erigon/node/gointerfaces/sentryproto"
+	"github.com/erigontech/erigon/node/gointerfaces/txpoolproto"
+	"github.com/erigontech/erigon/node/gointerfaces/typesproto"
 	"github.com/erigontech/erigon/node/nodecfg"
 	"github.com/erigontech/erigon/p2p"
 	"github.com/erigontech/erigon/p2p/enode"
@@ -537,7 +537,15 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 			// TODO: Auto-enable WIT protocol for Bor chains if not explicitly set
 			server := sentry.NewGrpcServer(backend.sentryCtx, nil, readNodeInfo, &cfg, protocol, logger)
 			backend.sentryServers = append(backend.sentryServers, server)
-			sentries = append(sentries, direct.NewSentryClientDirect(protocol, server))
+			var sideProtocols []sentryproto.Protocol
+			if stack.Config().P2P.EnableWitProtocol {
+				sideProtocols = append(sideProtocols, sentryproto.Protocol_WIT0)
+			}
+			sentryClient, err := direct.NewSentryClientDirect(protocol, server, sideProtocols)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create sentry client: %w", err)
+			}
+			sentries = append(sentries, sentryClient)
 		}
 
 		go func() {
@@ -686,6 +694,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 		genesis,
 		backend.config.NetworkID,
 		logger,
+		blockReader,
 	)
 
 	// limit "new block" broadcasts to at most 10 random peers at time
@@ -708,7 +717,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 		}
 	}
 
-	sentryMcDisableBlockDownload := chainConfig.Bor != nil || config.ElBlockDownloaderV2
+	const sentryMcDisableBlockDownload = true
 	backend.sentriesClient, err = sentry_multi_client.NewMultiClient(
 		backend.chainDB,
 		chainConfig,
@@ -1028,15 +1037,22 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 		logger,
 		chainConfig,
 		executionRpc,
-		backend.sentriesClient.Hd,
-		engine_block_downloader.NewEngineBlockDownloader(ctx,
-			logger, backend.sentriesClient.Hd, executionRpc,
-			backend.sentriesClient.Bd, backend.sentriesClient.BroadcastNewBlock, backend.sentriesClient.SendBodyRequest, blockReader,
-			backend.chainDB, chainConfig, tmpdir, config.Sync, config.ElBlockDownloaderV2, sentryMux(sentries), statusDataProvider),
+		engine_block_downloader.NewEngineBlockDownloader(
+			ctx,
+			logger,
+			executionRpc,
+			blockReader,
+			backend.chainDB,
+			chainConfig,
+			tmpdir,
+			config.Sync,
+			sentryMux(sentries),
+			statusDataProvider,
+		),
 		config.InternalCL && !config.CaplinConfig.EnableEngineAPI, // If the chain supports the engine API, then we should not make the server fail.
-		false,
 		config.Miner.EnabledPOS,
 		!config.PolygonPosSingleSlotFinality,
+		backend.txPoolRpcClient,
 	)
 	backend.engineBackendRPC = engineBackendRPC
 	// If we choose not to run a consensus layer, run our embedded.
@@ -1080,6 +1096,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 			backend.notifications,
 			backend.engineBackendRPC,
 			backend,
+			config.Dirs.Tmp,
 		)
 
 		// we need to initiate download before the heimdall services start rather than
@@ -1132,13 +1149,6 @@ func (s *Ethereum) Init(stack *node.Node, config *ethconfig.Config, chainConfig 
 	ctx := s.sentryCtx
 	chainKv := s.chainDB
 	var err error
-
-	if chainConfig.Bor == nil {
-		if !config.ElBlockDownloaderV2 {
-			s.sentriesClient.Hd.StartPoSDownloader(s.sentryCtx, s.sentriesClient.SendHeaderRequest, s.sentriesClient.Penalize)
-		}
-	}
-
 	emptyBadHash := config.BadBlockHash == common.Hash{}
 	if !emptyBadHash {
 		if err = chainKv.View(ctx, func(tx kv.Tx) error {
@@ -1205,7 +1215,14 @@ func (s *Ethereum) Init(stack *node.Node, config *ethconfig.Config, chainConfig 
 	}
 
 	if chainConfig.Bor == nil || config.PolygonPosSingleSlotFinality {
-		go s.engineBackendRPC.Start(ctx, &httpRpcCfg, s.chainDB, s.blockReader, s.rpcFilters, s.rpcDaemonStateCache, s.engine, s.ethRpcClient, s.txPoolRpcClient, s.miningRpcClient)
+		s.bgComponentsEg.Go(func() error {
+			defer s.logger.Debug("[EngineServer] goroutine terminated")
+			err := s.engineBackendRPC.Start(ctx, &httpRpcCfg, s.chainDB, s.blockReader, s.rpcFilters, s.rpcDaemonStateCache, s.engine, s.ethRpcClient, s.miningRpcClient)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Error("[EngineServer] background goroutine failed", "err", err)
+			}
+			return err
+		})
 	}
 
 	// Register the backend on the node
@@ -1231,7 +1248,7 @@ func (s *Ethereum) Etherbase() (eb common.Address, err error) {
 // StartMining starts the miner with the given number of CPU threads. If mining
 // is already running, this method adjust the number of threads allowed to use
 // and updates the minimum price required by the transaction pool.
-func (s *Ethereum) StartMining(ctx context.Context, db kv.RwDB, stateDiffClient *direct.StateDiffClientDirect, mining *stagedsync.Sync, miner stagedsync.MiningState, gasPrice *uint256.Int, quitCh chan struct{}, heimdallStore heimdall.Store, tmpDir string, logger log.Logger) error {
+func (s *Ethereum) StartMining(ctx context.Context, db kv.TemporalRwDB, stateDiffClient *direct.StateDiffClientDirect, mining *stagedsync.Sync, miner stagedsync.MiningState, gasPrice *uint256.Int, quitCh chan struct{}, heimdallStore heimdall.Store, tmpDir string, logger log.Logger) error {
 
 	var borcfg *bor.Bor
 	if b, ok := s.engine.(*bor.Bor); ok {

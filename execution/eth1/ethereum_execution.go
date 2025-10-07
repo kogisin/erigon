@@ -27,11 +27,9 @@ import (
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/math"
-	"github.com/erigontech/erigon-lib/gointerfaces"
-	"github.com/erigontech/erigon-lib/gointerfaces/executionproto"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/common/math"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbutils"
@@ -46,6 +44,8 @@ import (
 	"github.com/erigontech/erigon/execution/stagedsync"
 	"github.com/erigontech/erigon/execution/stages"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/node/gointerfaces"
+	"github.com/erigontech/erigon/node/gointerfaces/executionproto"
 	"github.com/erigontech/erigon/turbo/services"
 	"github.com/erigontech/erigon/turbo/shards"
 )
@@ -277,17 +277,16 @@ func (e *EthereumExecutionModule) ValidateChain(ctx context.Context, req *execut
 		}, nil
 	}
 
-	if err := e.db.Update(ctx, func(tx kv.RwTx) error {
-		return e.unwindToCommonCanonical(tx, header)
-	}); err != nil {
-		return nil, err
-	}
-
 	tx, err := e.db.BeginRwNosync(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	err = e.unwindToCommonCanonical(tx, header)
+	if err != nil {
+		return nil, err
+	}
 
 	status, lvh, validationError, criticalError := e.forkValidator.ValidatePayload(tx, header, body.RawBody(), e.logger)
 	if criticalError != nil {
