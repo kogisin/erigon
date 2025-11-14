@@ -21,9 +21,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/puzpuzpuz/xsync/v4"
 	"io/fs"
 	"iter"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -37,6 +37,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/puzpuzpuz/xsync/v4"
 
 	"github.com/c2h5oh/datasize"
 	"github.com/quic-go/quic-go/http3"
@@ -165,7 +167,8 @@ func (me *AggStats) AllTorrentsComplete() bool {
 }
 
 type requestHandler struct {
-	http.RoundTripper
+	// Separated this rather than embedded it to ensure our wrapper RoundTrip is called.
+	rt         http.RoundTripper
 	downloader *Downloader
 }
 
@@ -175,9 +178,7 @@ var cloudflareHeaders = http.Header{
 
 func insertCloudflareHeaders(req *http.Request) {
 	// Note this is clobbering the headers.
-	for key, value := range cloudflareHeaders {
-		req.Header[key] = value
-	}
+	maps.Copy(req.Header, cloudflareHeaders)
 }
 
 type roundTripperFunc func(req *http.Request) (*http.Response, error)
@@ -210,7 +211,7 @@ func (r *requestHandler) RoundTrip(req *http.Request) (resp *http.Response, err 
 	insertCloudflareHeaders(req)
 
 	webseedTripCount.Add(1)
-	resp, err = r.RoundTripper.RoundTrip(req)
+	resp, err = r.rt.RoundTrip(req)
 	if err != nil {
 		return
 	}
@@ -326,7 +327,7 @@ func configureHttp2(t *http.Transport) {
 func New(ctx context.Context, cfg *downloadercfg.Cfg, logger log.Logger, verbosity log.Lvl) (*Downloader, error) {
 	requestHandler := &requestHandler{}
 	{
-		requestHandler.RoundTripper = makeTransport()
+		requestHandler.rt = makeTransport()
 		cfg.ClientConfig.WebTransport = requestHandler
 		// requestHandler.downloader is set later.
 	}
@@ -662,7 +663,6 @@ func (d *Downloader) newStats(prevStats AggStats) AggStats {
 			noMetadata = append(noMetadata, t.Name())
 			continue
 		}
-		stats.FilesTotal += len(t.Files())
 
 		torrentName := t.Name()
 		torrentComplete := t.Complete().Bool()
@@ -867,7 +867,6 @@ func (d *Downloader) VerifyData(
 		// set limit here just to make load predictable, not to control Disk/CPU consumption
 		g.SetLimit(runtime.GOMAXPROCS(-1) * 4)
 		for _, t := range toVerify {
-			t := t
 			g.Go(func() error {
 				defer completedFiles.Add(1)
 				return VerifyFileFailFast(ctx, t, d.SnapDir(), &completedBytes)
